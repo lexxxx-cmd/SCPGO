@@ -147,6 +147,7 @@ double recentOptimizedY = 0.0;
 // ------------------------- ROS 发布器与导出文件 -------------------------
 ros::Publisher pubMapAftPGO, pubOdomAftPGO, pubPathAftPGO;
 ros::Publisher pubLoopScanLocal, pubLoopSubmapLocal;
+ros::Publisher pubLoopScanIcp, pubLoopSubmapIcp;
 ros::Publisher pubOdomRepubVerifier;
 
 std::string save_directory;
@@ -551,6 +552,17 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
         return std::nullopt;
     } else {
         std::cout << "[SC loop] ICP fitness test passed (" << icp.getFitnessScore() << " < " << loopFitnessScoreThreshold << "). Add this SC loop." << std::endl;
+        
+        // 发布经过 ICP 验证的成功匹配回环关键帧（ICP 配准后位置）和历史回环子地图
+        sensor_msgs::PointCloud2 loopScanIcpMsg;
+        pcl::toROSMsg(*unused_result, loopScanIcpMsg);
+        loopScanIcpMsg.header.frame_id = "camera_init";
+        pubLoopScanIcp.publish(loopScanIcpMsg);
+
+        sensor_msgs::PointCloud2 loopSubmapIcpMsg;
+        pcl::toROSMsg(*targetKeyframeCloud, loopSubmapIcpMsg);
+        loopSubmapIcpMsg.header.frame_id = "camera_init";
+        pubLoopSubmapIcp.publish(loopSubmapIcpMsg);
     }
 
     // Get pose transformation
@@ -1024,6 +1036,8 @@ int main(int argc, char **argv)
 
 	pubLoopScanLocal = nh.advertise<sensor_msgs::PointCloud2>("/loop_scan_local", 100);
 	pubLoopSubmapLocal = nh.advertise<sensor_msgs::PointCloud2>("/loop_submap_local", 100);
+	pubLoopScanIcp = nh.advertise<sensor_msgs::PointCloud2>("/loop_scan_icp", 100);
+	pubLoopSubmapIcp = nh.advertise<sensor_msgs::PointCloud2>("/loop_submap_icp", 100);
 
 
     // ------------------------- 后台工作线程 -------------------------
