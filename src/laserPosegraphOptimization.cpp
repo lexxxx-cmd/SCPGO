@@ -1,6 +1,7 @@
 #include <fstream>
 #include <math.h>
 #include <vector>
+#include <deque>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -77,8 +78,13 @@ double rotaionAccumulated = 1000000.0; // large value means must add the first g
 
 bool isNowKeyFrame = false; 
 
-Pose6D odom_pose_prev {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}; // init 
-Pose6D odom_pose_curr {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}; // init pose is zero 
+Pose6D odom_pose_prev {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}; // init
+Pose6D odom_pose_curr {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}; // init pose is zero
+
+// ------------------------- 滑动窗口：管理最近关键帧的降采样点云 -------------------------
+const int SLIDING_WINDOW_SIZE = 7; // [-6, 0] 共 7 帧
+std::deque<std::pair<int, pcl::PointCloud<PointType>::Ptr>> slidingWindowDeque;
+std::mutex mDeque;
 
 // ------------------------- 输入缓存：回调只负责入队 -------------------------
 std::queue<nav_msgs::Odometry::ConstPtr> odometryBuf;
@@ -364,6 +370,40 @@ pcl::PointCloud<PointType>::Ptr local2global(const pcl::PointCloud<PointType>::P
         cloudOut->points[i].x = transCur(0,0) * pointFrom.x + transCur(0,1) * pointFrom.y + transCur(0,2) * pointFrom.z + transCur(0,3);
         cloudOut->points[i].y = transCur(1,0) * pointFrom.x + transCur(1,1) * pointFrom.y + transCur(1,2) * pointFrom.z + transCur(1,3);
         cloudOut->points[i].z = transCur(2,0) * pointFrom.x + transCur(2,1) * pointFrom.y + transCur(2,2) * pointFrom.z + transCur(2,3);
+        cloudOut->points[i].intensity = pointFrom.intensity;
+    }
+
+    return cloudOut;
+}
+
+// 将 cloudIn（传感器坐标系）先变换到全局坐标系，再通过中心帧位姿逆变换到中心帧坐标系。
+// 等价于 T_center^{-1} * T_cloud * cloudIn，但分两步写清变换链。
+pcl::PointCloud<PointType>::Ptr local2center(
+    const pcl::PointCloud<PointType>::Ptr &cloudIn,
+    const Pose6D& cloudPose,    // cloudIn 在全局坐标系下的位姿
+    const Pose6D& centerPose)   // 中心帧在全局坐标系下的位姿
+{
+    // Step 1: cloud 传感器坐标系 → 全局坐标系
+    pcl::PointCloud<PointType>::Ptr cloudGlobal = local2global(cloudIn, cloudPose);
+
+    // Step 2: 全局坐标系 → 中心帧传感器坐标系 (T_center^{-1})
+    Eigen::Affine3f T_center = pcl::getTransformation(
+        centerPose.x, centerPose.y, centerPose.z,
+        centerPose.roll, centerPose.pitch, centerPose.yaw);
+    Eigen::Affine3f T_center_inv = T_center.inverse();
+
+    pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
+    int cloudSize = cloudGlobal->size();
+    cloudOut->resize(cloudSize);
+
+    int numberOfCores = 16;
+    #pragma omp parallel for num_threads(numberOfCores)
+    for (int i = 0; i < cloudSize; ++i)
+    {
+        const auto &pointFrom = cloudGlobal->points[i];
+        cloudOut->points[i].x = T_center_inv(0,0) * pointFrom.x + T_center_inv(0,1) * pointFrom.y + T_center_inv(0,2) * pointFrom.z + T_center_inv(0,3);
+        cloudOut->points[i].y = T_center_inv(1,0) * pointFrom.x + T_center_inv(1,1) * pointFrom.y + T_center_inv(1,2) * pointFrom.z + T_center_inv(1,3);
+        cloudOut->points[i].z = T_center_inv(2,0) * pointFrom.x + T_center_inv(2,1) * pointFrom.y + T_center_inv(2,2) * pointFrom.z + T_center_inv(2,3);
         cloudOut->points[i].intensity = pointFrom.intensity;
     }
 
