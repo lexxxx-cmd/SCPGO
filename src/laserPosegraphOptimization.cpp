@@ -19,6 +19,7 @@
 #include <pcl/common/transforms.h>
 #include <pcl/filters/extract_indices.h>
 #include <pcl/registration/icp.h>
+#include <pcl/segmentation/sac_segmentation.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/filters/filter.h>
 #include <pcl/filters/voxel_grid.h>
@@ -85,6 +86,12 @@ Pose6D odom_pose_curr {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}; // init pose is zero
 const int SLIDING_WINDOW_SIZE = 7; // [-6, 0] 共 7 帧
 std::deque<std::pair<int, pcl::PointCloud<PointType>::Ptr>> slidingWindowDeque;
 std::mutex mDeque;
+
+// ------------------------- 地面高度经验值与 RANSAC 参数 -------------------------
+double estimatedGroundZ = -2.0;   // 地面 Z 经验值（中心帧坐标系，EMA 维护，初始 -2m 典型 LiDAR 高度）
+bool groundZInitialized = false;
+const double GROUND_Z_EMA_ALPHA = 0.3;   // EMA 平滑系数（新值权重）
+const double GROUND_Z_MARGIN = 0.15;     // 裁剪容差（m），低于 estimatedZ + margin 的点被丢弃
 
 // ------------------------- 输入缓存：回调只负责入队 -------------------------
 std::queue<nav_msgs::Odometry::ConstPtr> odometryBuf;
@@ -154,6 +161,7 @@ double recentOptimizedY = 0.0;
 ros::Publisher pubMapAftPGO, pubOdomAftPGO, pubPathAftPGO;
 ros::Publisher pubLoopScanLocal, pubLoopSubmapLocal;
 ros::Publisher pubLoopScanIcp, pubLoopSubmapIcp;
+ros::Publisher pubWindowSubmapSC, pubWindowSubmapNoGround;
 ros::Publisher pubOdomRepubVerifier;
 
 std::string save_directory;
@@ -351,6 +359,88 @@ Pose6D diffTransformation(const Pose6D& _p1, const Pose6D& _p2)
 
     return Pose6D{double(abs(dx)), double(abs(dy)), double(abs(dz)), double(abs(droll)), double(abs(dpitch)), double(abs(dyaw))};
 } // SE3Diff
+
+// RANSAC 地面去除：拟合平面 + 法向检查 + EMA 维护地面 Z 经验值 + Z 裁剪残点。
+// 如果平面不满足地面条件（法向不接近Z轴、内点比例异常），仅用 EMA 维护值做 Z 裁剪，不做 RANSAC 提取。
+pcl::PointCloud<PointType>::Ptr removeGroundRANSAC(
+    const pcl::PointCloud<PointType>::Ptr &cloudIn,
+    float distanceThreshold = 0.2)
+{
+    if (cloudIn->size() < 100)
+        return cloudIn;  // 点数过少不做处理
+
+    bool ransacOK = false;
+    double ransacGroundZ = estimatedGroundZ;
+
+    // ---------- Step 1: RANSAC 平面拟合 ----------
+    pcl::SACSegmentation<PointType> seg;
+    pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+    pcl::ModelCoefficients::Ptr coeff(new pcl::ModelCoefficients);
+
+    seg.setOptimizeCoefficients(true);
+    seg.setModelType(pcl::SACMODEL_PLANE);
+    seg.setMethodType(pcl::SAC_RANSAC);
+    seg.setDistanceThreshold(distanceThreshold);
+    seg.setMaxIterations(100);
+    seg.setInputCloud(cloudIn);
+    seg.segment(*inliers, *coeff);
+
+    if (!inliers->indices.empty()) {
+        // 法向检查：地面法向量应接近 (0, 0, 1)
+        Eigen::Vector3f groundNormal(coeff->values[0], coeff->values[1], coeff->values[2]);
+        float zAlignment = std::abs(groundNormal.dot(Eigen::Vector3f::UnitZ()));
+        float inlierRatio = float(inliers->indices.size()) / float(cloudIn->size());
+
+        if (zAlignment >= 0.7 && inlierRatio >= 0.1 && inlierRatio <= 0.8) {
+            // 平面方程 ax+by+cz+d=0，原点 (0,0) 处 z = -d/c
+            ransacGroundZ = -coeff->values[3] / coeff->values[2];
+            ransacOK = true;
+
+            std::cout << "[RANSAC] Ground plane found: Z=" << ransacGroundZ
+                      << " (inliers=" << int(inlierRatio * 100)
+                      << "%, normal_z=" << zAlignment << ")" << std::endl;
+        }
+    }
+
+    // ---------- Step 2: EMA 更新地面经验高度 ----------
+    if (ransacOK) {
+        if (!groundZInitialized) {
+            estimatedGroundZ = ransacGroundZ;
+            groundZInitialized = true;
+        } else {
+            estimatedGroundZ = (1.0 - GROUND_Z_EMA_ALPHA) * estimatedGroundZ
+                             + GROUND_Z_EMA_ALPHA * ransacGroundZ;
+        }
+    }
+    // 即使 RANSAC 本次失败，仍然沿用上次的 estimatedGroundZ 做 Z 裁剪
+
+    // ---------- Step 3: RANSAC 提取非地面（如果成功） ----------
+    pcl::PointCloud<PointType>::Ptr workingCloud(new pcl::PointCloud<PointType>());
+    if (ransacOK) {
+        pcl::ExtractIndices<PointType> extract;
+        extract.setInputCloud(cloudIn);
+        extract.setIndices(inliers);
+        extract.setNegative(true);  // 去掉地面内点
+        extract.filter(*workingCloud);
+    } else {
+        *workingCloud = *cloudIn;  // RANSAC 不可靠，保留全云，仅靠 Z 裁剪
+    }
+
+    // ---------- Step 4: Z 裁剪，清除 RANSAC 漏掉的地面残点 ----------
+    pcl::PointCloud<PointType>::Ptr filtered(new pcl::PointCloud<PointType>());
+    float cutoffZ = float(estimatedGroundZ + GROUND_Z_MARGIN);
+    for (const auto& pt : workingCloud->points) {
+        if (pt.z > cutoffZ)
+            filtered->push_back(pt);
+    }
+
+    std::cout << "[RANSAC] " << cloudIn->size() << " → " << filtered->size()
+              << " pts (ransac=" << (ransacOK ? "ok" : "skip")
+              << ", groundZ_ema=" << estimatedGroundZ
+              << ", cutoffZ=" << cutoffZ << ")" << std::endl;
+
+    return filtered;
+}
 
 // 把局部点云变换到全局坐标系。
 pcl::PointCloud<PointType>::Ptr local2global(const pcl::PointCloud<PointType>::Ptr &cloudIn, const Pose6D& tf)
@@ -607,7 +697,7 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
         *targetKeyframeCloud = *cloud_temp;
     }
 
-    // loop verification 
+    // loop verification
     sensor_msgs::PointCloud2 cureKeyframeCloudMsg;
     pcl::toROSMsg(*cureKeyframeCloud, cureKeyframeCloudMsg);
     cureKeyframeCloudMsg.header.frame_id = "camera_init";
@@ -620,7 +710,7 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
 
     // ICP Settings
     pcl::IterativeClosestPoint<PointType, PointType> icp;
-    icp.setMaxCorrespondenceDistance(150); // giseop , use a value can cover 2*historyKeyframeSearchNum range in meter 
+    icp.setMaxCorrespondenceDistance(150); // giseop , use a value can cover 2*historyKeyframeSearchNum range in meter
     icp.setMaximumIterations(100);
     icp.setTransformationEpsilon(1e-6);
     icp.setEuclideanFitnessEpsilon(1e-6);
@@ -631,14 +721,14 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
     icp.setInputTarget(targetKeyframeCloud);
     pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
     icp.align(*unused_result);
- 
-    float loopFitnessScoreThreshold = 0.3; // user parameter but fixed low value is safe. 
+
+    float loopFitnessScoreThreshold = 0.3; // user parameter but fixed low value is safe.
     if (icp.hasConverged() == false || icp.getFitnessScore() > loopFitnessScoreThreshold) {
         std::cout << "[SC loop] ICP fitness test failed (" << icp.getFitnessScore() << " > " << loopFitnessScoreThreshold << "). Reject this SC loop." << std::endl;
         return std::nullopt;
     } else {
         std::cout << "[SC loop] ICP fitness test passed (" << icp.getFitnessScore() << " < " << loopFitnessScoreThreshold << "). Add this SC loop." << std::endl;
-        
+
         // 发布经过 ICP 验证的成功匹配回环关键帧（ICP 配准后位置）和历史回环子地图
         sensor_msgs::PointCloud2 loopScanIcpMsg;
         pcl::toROSMsg(*unused_result, loopScanIcpMsg);
@@ -797,12 +887,33 @@ void process_pg()
                 mDeque.unlock();
             }
 
-            // 3) 对合并后的子地图降采样，控制点数
-            downSizeFilterScancontext.setInputCloud(windowSubmap);
+            // 3) 发布原始合并子地图（去地面前，用于对比查看）
+            {
+                sensor_msgs::PointCloud2 rawMsg;
+                pcl::toROSMsg(*windowSubmap, rawMsg);
+                rawMsg.header.frame_id = "camera_init";
+                rawMsg.header.stamp = ros::Time().fromSec(timeLaserOdometry);
+                pubWindowSubmapSC.publish(rawMsg);
+            }
+
+            // 4) RANSAC 去地面
+            pcl::PointCloud<PointType>::Ptr windowSubmapNoGround = removeGroundRANSAC(windowSubmap);
+
+            // 5) 发布去地面后子地图（用于 RViz 检查效果）
+            {
+                sensor_msgs::PointCloud2 noGroundMsg;
+                pcl::toROSMsg(*windowSubmapNoGround, noGroundMsg);
+                noGroundMsg.header.frame_id = "camera_init";
+                noGroundMsg.header.stamp = ros::Time().fromSec(timeLaserOdometry);
+                pubWindowSubmapNoGround.publish(noGroundMsg);
+            }
+
+            // 6) 对去地面后子地图降采样，控制点数
+            downSizeFilterScancontext.setInputCloud(windowSubmapNoGround);
             downSizeFilterScancontext.filter(*windowSubmapDS);
             // --- 滑动窗口管理结束 ---
 
-            // 用滑动窗口子地图替代单帧生成 Scan Context 描述子
+            // 用去地面滑动窗口子地图生成 Scan Context 描述子
             scManager.makeAndSaveScancontextAndKeys(*windowSubmapDS);
 
             laserCloudMapPGORedraw = true;
@@ -1135,7 +1246,7 @@ int main(int argc, char **argv)
 
 
 	// 关键帧点云、ICP 子地图和全局地图分别使用不同下采样尺度。
-    float filter_size = 0.1; 
+    float filter_size = 0.01; 
     downSizeFilterScancontext.setLeafSize(filter_size, filter_size, filter_size);
     downSizeFilterICP.setLeafSize(filter_size, filter_size, filter_size);
 
@@ -1159,6 +1270,8 @@ int main(int argc, char **argv)
 	pubLoopSubmapLocal = nh.advertise<sensor_msgs::PointCloud2>("/loop_submap_local", 100);
 	pubLoopScanIcp = nh.advertise<sensor_msgs::PointCloud2>("/loop_scan_icp", 100);
 	pubLoopSubmapIcp = nh.advertise<sensor_msgs::PointCloud2>("/loop_submap_icp", 100);
+	pubWindowSubmapSC = nh.advertise<sensor_msgs::PointCloud2>("/window_submap_raw", 100);
+	pubWindowSubmapNoGround = nh.advertise<sensor_msgs::PointCloud2>("/window_submap_noground", 100);
 
 
     // ------------------------- 后台工作线程 -------------------------
