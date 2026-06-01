@@ -713,6 +713,9 @@ void process_pg()
             downSizeFilterScancontext.setInputCloud(thisKeyFrame);
             downSizeFilterScancontext.filter(*thisKeyFrameDS);
 
+            const int curr_node_idx = int(keyframePoses.size()); // 即将插入的关键帧索引
+            const int prev_node_idx = curr_node_idx - 1;
+
             mKF.lock();
             keyframeLaserClouds.push_back(thisKeyFrameDS);
             keyframeLaserCloudsFull.push_back(thisKeyFrame);
@@ -720,13 +723,45 @@ void process_pg()
             keyframePosesUpdated.push_back(pose_curr); // init
             keyframeTimes.push_back(timeLaserOdometry);
 
-            scManager.makeAndSaveScancontextAndKeys(*thisKeyFrameDS);
+            // --- 滑动窗口管理 ---
+            pcl::PointCloud<PointType>::Ptr windowSubmap(new pcl::PointCloud<PointType>());
+            pcl::PointCloud<PointType>::Ptr windowSubmapDS(new pcl::PointCloud<PointType>());
+
+            // 1) 将当前帧降采样点云加入滑动窗口
+            mDeque.lock();
+            {
+                pcl::PointCloud<PointType>::Ptr cloudCopy(new pcl::PointCloud<PointType>());
+                pcl::copyPointCloud(*thisKeyFrameDS, *cloudCopy);
+                slidingWindowDeque.push_back({curr_node_idx, cloudCopy});
+
+                // 保持窗口大小不超过 SLIDING_WINDOW_SIZE
+                while (int(slidingWindowDeque.size()) > SLIDING_WINDOW_SIZE) {
+                    slidingWindowDeque.pop_front();
+                }
+
+                // 2) 构建滑动窗口子地图：逐帧变换到中心帧坐标系后合并
+                const Pose6D& centerPose = keyframePosesUpdated[curr_node_idx];
+                for (auto& kv : slidingWindowDeque) {
+                    int kfIdx = kv.first;
+                    const auto& cloud = kv.second;
+                    // 先到全局、再到中心帧坐标系（确保所有点云统一到中心帧位姿下）
+                    *windowSubmap += *local2center(cloud, keyframePosesUpdated[kfIdx], centerPose);
+                }
+
+                mDeque.unlock();
+            }
+
+            // 3) 对合并后的子地图降采样，控制点数
+            downSizeFilterScancontext.setInputCloud(windowSubmap);
+            downSizeFilterScancontext.filter(*windowSubmapDS);
+            // --- 滑动窗口管理结束 ---
+
+            // 用滑动窗口子地图替代单帧生成 Scan Context 描述子
+            scManager.makeAndSaveScancontextAndKeys(*windowSubmapDS);
 
             laserCloudMapPGORedraw = true;
-            mKF.unlock(); 
-
-            const int prev_node_idx = keyframePoses.size() - 2; 
-            const int curr_node_idx = keyframePoses.size() - 1; // becuase cpp starts with 0 (actually this index could be any number, but for simple implementation, we follow sequential indexing)
+            mKF.unlock();
+            // curr_node_idx / prev_node_idx 已在 lock 之前计算完毕，无需重复
             if( ! gtSAMgraphMade /* prior node */) {
                 const int init_node_idx = 0; 
                 gtsam::Pose3 poseOrigin = Pose6DtoGTSAMPose3(keyframePoses.at(init_node_idx));
