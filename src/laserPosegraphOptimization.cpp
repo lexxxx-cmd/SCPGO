@@ -558,8 +558,54 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
     int historyKeyframeSearchNum = 25; // enough. ex. [-25, 25] covers submap length of 50x1 = 50m if every kf gap is 1m
     pcl::PointCloud<PointType>::Ptr cureKeyframeCloud(new pcl::PointCloud<PointType>());
     pcl::PointCloud<PointType>::Ptr targetKeyframeCloud(new pcl::PointCloud<PointType>());
-    loopFindNearKeyframesCloud(cureKeyframeCloud, _curr_kf_idx, 0, _loop_kf_idx); // use same root of loop kf idx 
-    loopFindNearKeyframesCloud(targetKeyframeCloud, _loop_kf_idx, historyKeyframeSearchNum, _loop_kf_idx); 
+
+    // ---- 当前帧子地图：使用滑动窗口 [curr-6, curr]（仅向前追溯历史帧） ----
+    cureKeyframeCloud->clear();
+    int currWindowStart = std::max(0, _curr_kf_idx - (SLIDING_WINDOW_SIZE - 1));
+    for (int i = currWindowStart; i <= _curr_kf_idx; ++i) {
+        mKF.lock();
+        *cureKeyframeCloud += *local2global(keyframeLaserClouds[i], keyframePosesUpdated[i]);
+        mKF.unlock();
+    }
+    // 降采样
+    {
+        pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
+        downSizeFilterICP.setInputCloud(cureKeyframeCloud);
+        downSizeFilterICP.filter(*cloud_temp);
+        *cureKeyframeCloud = *cloud_temp;
+    }
+
+    // ---- 历史帧子地图：时间窗口 ±25 + 空间近邻（15m 半径） ----
+    loopFindNearKeyframesCloud(targetKeyframeCloud, _loop_kf_idx, historyKeyframeSearchNum, _loop_kf_idx);
+
+    // 空间近邻：暴力搜索 15m 半径内的历史关键帧，合并到 target submap
+    {
+        const double spatialRadius = 15.0;
+        const double spatialRadiusSq = spatialRadius * spatialRadius;
+        Pose6D& loopPose = keyframePosesUpdated[_loop_kf_idx];
+        for (int i = 0; i < int(keyframeLaserClouds.size()); ++i) {
+            // 跳过已在时间窗口内的帧，避免重复合并
+            if (std::abs(i - _loop_kf_idx) <= historyKeyframeSearchNum)
+                continue;
+            Pose6D& pose_i = keyframePosesUpdated[i];
+            double dx = pose_i.x - loopPose.x;
+            double dy = pose_i.y - loopPose.y;
+            double dz = pose_i.z - loopPose.z;
+            double distSq = dx*dx + dy*dy + dz*dz;
+            if (distSq < spatialRadiusSq) {
+                mKF.lock();
+                *targetKeyframeCloud += *local2global(keyframeLaserClouds[i], keyframePosesUpdated[i]);
+                mKF.unlock();
+            }
+        }
+    }
+    // 对合并空间近邻后的 target 再次降采样
+    {
+        pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
+        downSizeFilterICP.setInputCloud(targetKeyframeCloud);
+        downSizeFilterICP.filter(*cloud_temp);
+        *targetKeyframeCloud = *cloud_temp;
+    }
 
     // loop verification 
     sensor_msgs::PointCloud2 cureKeyframeCloudMsg;
