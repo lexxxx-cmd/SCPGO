@@ -772,7 +772,7 @@ void process_pg()
 {
     while(ros::ok())
     {
-		while ( !odometryBuf.empty() && !fullResBuf.empty() )
+		while ( ros::ok() && !odometryBuf.empty() && !fullResBuf.empty() )
         {
             //
             // pop and check keyframe is or not  
@@ -1033,7 +1033,7 @@ void process_icp(void)
 {
     while(ros::ok())
     {
-		while ( !scLoopICPBuf.empty() )
+		while ( ros::ok() && !scLoopICPBuf.empty() )
         {
             if( scLoopICPBuf.size() > 30 ) {
                 ROS_WARN("Too many loop clousre candidates to be ICPed is waiting ... Do process_lcd less frequently (adjust loopClosureFrequency)");
@@ -1263,10 +1263,12 @@ int main(int argc, char **argv)
     scManager.setMaximumRadius(scMaximumRadius);
 
 
-	// 关键帧点云、ICP 子地图和全局地图分别使用不同下采样尺度。
-    float filter_size = 0.01; 
-    downSizeFilterScancontext.setLeafSize(filter_size, filter_size, filter_size);
-    downSizeFilterICP.setLeafSize(filter_size, filter_size, filter_size);
+	// 关键帧点云、ICP 子地图分别使用不同下采样尺度。
+    // 滑动窗口/空间近邻合并后点云范围大幅增加，leaf 过小会导致 VoxelGrid 整数索引溢出
+    float sc_filter_size = 0.05;   // SC 描述子：5cm，7 帧滑动窗口
+    float icp_filter_size = 0.1;   // ICP 子地图：10cm，时间窗口 + 空间近邻可能跨越 50m+
+    downSizeFilterScancontext.setLeafSize(sc_filter_size, sc_filter_size, sc_filter_size);
+    downSizeFilterICP.setLeafSize(icp_filter_size, icp_filter_size, icp_filter_size);
 
     double mapVizFilterSize;
 	nh.param<double>("mapviz_filter_size", mapVizFilterSize, 0.4); // pose assignment every k frames 
