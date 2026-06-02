@@ -92,6 +92,8 @@ double estimatedGroundZ = -2.0;   // 地面 Z 经验值（中心帧坐标系，E
 bool groundZInitialized = false;
 const double GROUND_Z_EMA_ALPHA = 0.3;   // EMA 平滑系数（新值权重）
 const double GROUND_Z_MARGIN = 0.15;     // 裁剪容差（m），低于 estimatedZ + margin 的点被丢弃
+bool useGroundRemoval = true;            // nh.param 开关：是否启用 RANSAC 去地面
+bool useICPSubmapEnhancement = true;     // nh.param 开关：是否启用 ICP 子地图增强（滑动窗口+空间近邻）
 
 // ------------------------- 输入缓存：回调只负责入队 -------------------------
 std::queue<nav_msgs::Odometry::ConstPtr> odometryBuf;
@@ -649,52 +651,58 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
     pcl::PointCloud<PointType>::Ptr cureKeyframeCloud(new pcl::PointCloud<PointType>());
     pcl::PointCloud<PointType>::Ptr targetKeyframeCloud(new pcl::PointCloud<PointType>());
 
-    // ---- 当前帧子地图：使用滑动窗口 [curr-6, curr]（仅向前追溯历史帧） ----
-    cureKeyframeCloud->clear();
-    int currWindowStart = std::max(0, _curr_kf_idx - (SLIDING_WINDOW_SIZE - 1));
-    for (int i = currWindowStart; i <= _curr_kf_idx; ++i) {
-        mKF.lock();
-        *cureKeyframeCloud += *local2global(keyframeLaserClouds[i], keyframePosesUpdated[i]);
-        mKF.unlock();
-    }
-    // 降采样
-    {
-        pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
-        downSizeFilterICP.setInputCloud(cureKeyframeCloud);
-        downSizeFilterICP.filter(*cloud_temp);
-        *cureKeyframeCloud = *cloud_temp;
-    }
+    if (useICPSubmapEnhancement) {
+        // ---- 当前帧子地图：使用滑动窗口 [curr-6, curr]（仅向前追溯历史帧） ----
+        cureKeyframeCloud->clear();
+        int currWindowStart = std::max(0, _curr_kf_idx - (SLIDING_WINDOW_SIZE - 1));
+        for (int i = currWindowStart; i <= _curr_kf_idx; ++i) {
+            mKF.lock();
+            *cureKeyframeCloud += *local2global(keyframeLaserClouds[i], keyframePosesUpdated[i]);
+            mKF.unlock();
+        }
+        // 降采样
+        {
+            pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
+            downSizeFilterICP.setInputCloud(cureKeyframeCloud);
+            downSizeFilterICP.filter(*cloud_temp);
+            *cureKeyframeCloud = *cloud_temp;
+        }
 
-    // ---- 历史帧子地图：时间窗口 ±25 + 空间近邻（15m 半径） ----
-    loopFindNearKeyframesCloud(targetKeyframeCloud, _loop_kf_idx, historyKeyframeSearchNum, _loop_kf_idx);
+        // ---- 历史帧子地图：时间窗口 ±25 + 空间近邻（15m 半径） ----
+        loopFindNearKeyframesCloud(targetKeyframeCloud, _loop_kf_idx, historyKeyframeSearchNum, _loop_kf_idx);
 
-    // 空间近邻：暴力搜索 15m 半径内的历史关键帧，合并到 target submap
-    {
-        const double spatialRadius = 15.0;
-        const double spatialRadiusSq = spatialRadius * spatialRadius;
-        Pose6D& loopPose = keyframePosesUpdated[_loop_kf_idx];
-        for (int i = 0; i < int(keyframeLaserClouds.size()); ++i) {
-            // 跳过已在时间窗口内的帧，避免重复合并
-            if (std::abs(i - _loop_kf_idx) <= historyKeyframeSearchNum)
-                continue;
-            Pose6D& pose_i = keyframePosesUpdated[i];
-            double dx = pose_i.x - loopPose.x;
-            double dy = pose_i.y - loopPose.y;
-            double dz = pose_i.z - loopPose.z;
-            double distSq = dx*dx + dy*dy + dz*dz;
-            if (distSq < spatialRadiusSq) {
-                mKF.lock();
-                *targetKeyframeCloud += *local2global(keyframeLaserClouds[i], keyframePosesUpdated[i]);
-                mKF.unlock();
+        // 空间近邻：暴力搜索 15m 半径内的历史关键帧，合并到 target submap
+        {
+            const double spatialRadius = 15.0;
+            const double spatialRadiusSq = spatialRadius * spatialRadius;
+            Pose6D& loopPose = keyframePosesUpdated[_loop_kf_idx];
+            for (int i = 0; i < int(keyframeLaserClouds.size()); ++i) {
+                // 跳过已在时间窗口内的帧，避免重复合并
+                if (std::abs(i - _loop_kf_idx) <= historyKeyframeSearchNum)
+                    continue;
+                Pose6D& pose_i = keyframePosesUpdated[i];
+                double dx = pose_i.x - loopPose.x;
+                double dy = pose_i.y - loopPose.y;
+                double dz = pose_i.z - loopPose.z;
+                double distSq = dx*dx + dy*dy + dz*dz;
+                if (distSq < spatialRadiusSq) {
+                    mKF.lock();
+                    *targetKeyframeCloud += *local2global(keyframeLaserClouds[i], keyframePosesUpdated[i]);
+                    mKF.unlock();
+                }
             }
         }
-    }
-    // 对合并空间近邻后的 target 再次降采样
-    {
-        pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
-        downSizeFilterICP.setInputCloud(targetKeyframeCloud);
-        downSizeFilterICP.filter(*cloud_temp);
-        *targetKeyframeCloud = *cloud_temp;
+        // 对合并空间近邻后的 target 再次降采样
+        {
+            pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
+            downSizeFilterICP.setInputCloud(targetKeyframeCloud);
+            downSizeFilterICP.filter(*cloud_temp);
+            *targetKeyframeCloud = *cloud_temp;
+        }
+    } else {
+        // 原始逻辑：当前帧仅自己，历史帧仅时间窗口
+        loopFindNearKeyframesCloud(cureKeyframeCloud, _curr_kf_idx, 0, _loop_kf_idx);
+        loopFindNearKeyframesCloud(targetKeyframeCloud, _loop_kf_idx, historyKeyframeSearchNum, _loop_kf_idx);
     }
 
     // loop verification
@@ -887,34 +895,41 @@ void process_pg()
                 mDeque.unlock();
             }
 
-            // 3) 发布原始合并子地图（去地面前，用于对比查看）
-            {
-                sensor_msgs::PointCloud2 rawMsg;
-                pcl::toROSMsg(*windowSubmap, rawMsg);
-                rawMsg.header.frame_id = "camera_init";
-                rawMsg.header.stamp = ros::Time().fromSec(timeLaserOdometry);
-                pubWindowSubmapSC.publish(rawMsg);
+            if (useGroundRemoval) {
+                // 3) 发布原始合并子地图（去地面前，用于对比查看）
+                {
+                    sensor_msgs::PointCloud2 rawMsg;
+                    pcl::toROSMsg(*windowSubmap, rawMsg);
+                    rawMsg.header.frame_id = "camera_init";
+                    rawMsg.header.stamp = ros::Time().fromSec(timeLaserOdometry);
+                    pubWindowSubmapSC.publish(rawMsg);
+                }
+
+                // 4) RANSAC 去地面
+                pcl::PointCloud<PointType>::Ptr windowSubmapNoGround = removeGroundRANSAC(windowSubmap);
+
+                // 5) 发布去地面后子地图（用于 RViz 检查效果）
+                {
+                    sensor_msgs::PointCloud2 noGroundMsg;
+                    pcl::toROSMsg(*windowSubmapNoGround, noGroundMsg);
+                    noGroundMsg.header.frame_id = "camera_init";
+                    noGroundMsg.header.stamp = ros::Time().fromSec(timeLaserOdometry);
+                    pubWindowSubmapNoGround.publish(noGroundMsg);
+                }
+
+                // 6) 对去地面后子地图降采样，控制点数
+                downSizeFilterScancontext.setInputCloud(windowSubmapNoGround);
+                downSizeFilterScancontext.filter(*windowSubmapDS);
+
+                // 用去地面滑动窗口子地图生成 Scan Context 描述子
+                scManager.makeAndSaveScancontextAndKeys(*windowSubmapDS);
+            } else {
+                // 不去地面：直接对原始子地图降采样生成 SC 描述子
+                downSizeFilterScancontext.setInputCloud(windowSubmap);
+                downSizeFilterScancontext.filter(*windowSubmapDS);
+                scManager.makeAndSaveScancontextAndKeys(*windowSubmapDS);
             }
-
-            // 4) RANSAC 去地面
-            pcl::PointCloud<PointType>::Ptr windowSubmapNoGround = removeGroundRANSAC(windowSubmap);
-
-            // 5) 发布去地面后子地图（用于 RViz 检查效果）
-            {
-                sensor_msgs::PointCloud2 noGroundMsg;
-                pcl::toROSMsg(*windowSubmapNoGround, noGroundMsg);
-                noGroundMsg.header.frame_id = "camera_init";
-                noGroundMsg.header.stamp = ros::Time().fromSec(timeLaserOdometry);
-                pubWindowSubmapNoGround.publish(noGroundMsg);
-            }
-
-            // 6) 对去地面后子地图降采样，控制点数
-            downSizeFilterScancontext.setInputCloud(windowSubmapNoGround);
-            downSizeFilterScancontext.filter(*windowSubmapDS);
             // --- 滑动窗口管理结束 ---
-
-            // 用去地面滑动窗口子地图生成 Scan Context 描述子
-            scManager.makeAndSaveScancontextAndKeys(*windowSubmapDS);
 
             laserCloudMapPGORedraw = true;
             mKF.unlock();
@@ -1232,8 +1247,10 @@ int main(int argc, char **argv)
 	nh.param<double>("keyframe_deg_gap", keyframeDegGap, 10.0); // pose assignment every k deg rot 
     keyframeRadGap = deg2rad(keyframeDegGap);
 
-	nh.param<double>("sc_dist_thres", scDistThres, 0.2);  
-	nh.param<double>("sc_max_radius", scMaximumRadius, 80.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor 
+	nh.param<double>("sc_dist_thres", scDistThres, 0.2);
+	nh.param<double>("sc_max_radius", scMaximumRadius, 80.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor
+	nh.param<bool>("use_ground_removal", useGroundRemoval, true);             // 是否启用 RANSAC 去地面
+	nh.param<bool>("use_icp_submap_enhancement", useICPSubmapEnhancement, true); // 是否启用 ICP 子地图增强
 
     ISAM2Params parameters;
     parameters.relinearizeThreshold = 0.01;
