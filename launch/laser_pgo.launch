@@ -7,26 +7,26 @@
     <!-- ============================================================ -->
 
     <!-- 节点名称 -->
-    <arg name="node_name" default="laserPGO" />
+    <arg name="node_name" default="alaserPGO" />
 
     <!-- ==================== 输出路径 ==================== -->
     <arg name="save_directory" default="$(find SCPGO)/output/" />
 
     <!-- ==================== 关键帧参数 ==================== -->
-    <arg name="keyframe_meter_gap" default="2.0" />
+    <arg name="keyframe_meter_gap" default="0.2" />
     <arg name="keyframe_deg_gap"   default="10.0" />
 
     <!-- ==================== Scan Context ==================== -->
     <arg name="sc_dist_thres" default="0.2" />
-    <arg name="sc_max_radius" default="80.0" />
+    <arg name="sc_max_radius" default="40.0" />
     <!-- 80m 推荐室外，20-40m 推荐室内 -->
 
     <!-- ==================== 功能开关 ==================== -->
-    <arg name="use_ground_removal"        default="true" />
-    <arg name="use_icp_submap_enhancement" default="true" />
+    <arg name="use_ground_removal"        default="false" />
+    <arg name="use_icp_submap_enhancement" default="false" />
 
     <!-- ==================== 可视化 ==================== -->
-    <arg name="mapviz_filter_size" default="0.4" />
+    <arg name="mapviz_filter_size" default="0.1" />
 
     <!-- ==================== 输入话题 (可重映射) ==================== -->
     <arg name="cloud_topic"  default="/velodyne_cloud_registered_local" />
@@ -36,7 +36,7 @@
     <!-- ============================================================ -->
     <!-- laserPGO 节点                                                -->
     <!-- ============================================================ -->
-    <node pkg="SCPGO" type="laserPGO" name="$(arg node_name)" output="screen">
+    <node pkg="SCPGO" type="alaserPGO" name="$(arg node_name)" output="screen">
 
         <!-- 输出路径 -->
         <param name="save_directory" value="$(arg save_directory)" />

@@ -1228,6 +1228,7 @@ int main(int argc, char **argv)
 {
 	ros::init(argc, argv, "laserPGO");
 	ros::NodeHandle nh;
+	ros::NodeHandle pnh("~");
 
 
     // ------------------------- 输出文件路径 -------------------------
@@ -1249,8 +1250,8 @@ int main(int argc, char **argv)
 
 	nh.param<double>("sc_dist_thres", scDistThres, 0.2);
 	nh.param<double>("sc_max_radius", scMaximumRadius, 80.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor
-	nh.param<bool>("use_ground_removal", useGroundRemoval, true);             // 是否启用 RANSAC 去地面
-	nh.param<bool>("use_icp_submap_enhancement", useICPSubmapEnhancement, true); // 是否启用 ICP 子地图增强
+	pnh.param<bool>("use_ground_removal", useGroundRemoval, true);             // 是否启用 RANSAC 去地面
+	pnh.param<bool>("use_icp_submap_enhancement", useICPSubmapEnhancement, true); // 是否启用 ICP 子地图增强
 
     ISAM2Params parameters;
     parameters.relinearizeThreshold = 0.01;
