@@ -19,12 +19,34 @@ find_package(catkin REQUIRED COMPONENTS
 
 ## System dependencies are found with CMake's conventions
 # find_package(Boost REQUIRED COMPONENTS system)
+find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(Ceres REQUIRED)
 
 find_package(OpenMP REQUIRED)
-find_package(GTSAM REQUIRED QUIET)
+
+find_package(CUDA REQUIRED)
+message(STATUS "CUDA_FOUND = ${CUDA_FOUND}")
+message(STATUS "CUDA_INCLUDE_DIRS = ${CUDA_INCLUDE_DIRS}")
+message(STATUS "CUDA_LIBRARIES = ${CUDA_LIBRARIES}")
+message(STATUS "CUDA_CUDART_LIBRARY = ${CUDA_CUDART_LIBRARY}")
+
+# Old FindCUDA doesn't create CUDA:: imported targets, but PCL and other
+# dependencies reference them.  Create the missing targets manually.
+get_filename_component(_cuda_root "${CUDA_INCLUDE_DIRS}" DIRECTORY)
+set(_cuda_libdir "${_cuda_root}/lib64")
+foreach(_lib cublas cudart cusolver cusparse)
+  if(NOT TARGET CUDA::${_lib})
+    add_library(CUDA::${_lib} UNKNOWN IMPORTED)
+    set_target_properties(CUDA::${_lib} PROPERTIES
+      IMPORTED_LOCATION "${_cuda_libdir}/lib${_lib}.so"
+      INTERFACE_INCLUDE_DIRECTORIES "${CUDA_INCLUDE_DIRS}")
+    message(STATUS "  -> Created CUDA::${_lib} (${_cuda_libdir}/lib${_lib}.so)")
+  endif()
+endforeach()
+
+find_package(GTSAM REQUIRED)
 find_package(Boost REQUIRED COMPONENTS serialization thread timer chrono)
 
 
@@ -129,12 +151,14 @@ catkin_package(
 ## Your package locations should be listed before other locations
 include_directories(
 # include
+  ${EIGEN3_INCLUDE_DIRS}
   include
   ${catkin_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
   ${CERES_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
   ${GTSAM_INCLUDE_DIR}
+  ${CUDA_INCLUDE_DIRS}
 )
 
 ## Declare a C++ library
@@ -157,9 +181,18 @@ add_executable(alaserPGO
 target_compile_options(alaserPGO 
   PRIVATE ${OpenMP_CXX_FLAGS}
 )
-target_link_libraries(alaserPGO 
+message(STATUS "=== LINK DEBUG ===")
+message(STATUS "catkin_LIBRARIES = ${catkin_LIBRARIES}")
+message(STATUS "PCL_LIBRARIES = ${PCL_LIBRARIES}")
+message(STATUS "CERES_LIBRARIES = ${CERES_LIBRARIES}")
+message(STATUS "CUDA_LIBRARIES = ${CUDA_LIBRARIES}")
+message(STATUS "CUDA_CUDART_LIBRARY = ${CUDA_CUDART_LIBRARY}")
+
+target_link_libraries(alaserPGO
   ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${CERES_LIBRARIES}
   ${OpenMP_CXX_FLAGS}
+  ${CUDA_LIBRARIES}
+  ${CUDA_CUDART_LIBRARY}
   gtsam
 )
 
