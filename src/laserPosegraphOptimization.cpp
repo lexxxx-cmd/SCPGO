@@ -115,6 +115,12 @@ double loopNoiseScore = 0.5;       // 回环噪声方差（越小越信任回环
 double loopKernelParam = 1.0;      // 鲁棒核参数 k（越小越激进拒绝异常值）
 std::string loopKernelType = "geman_mcclure"; // cauchy / dcs / geman_mcclure
 
+// 空间近邻回环检测参数（从 launch 文件读取）
+bool useSpatialLoopClosure = true;        // 是否启用空间近邻回环
+double spatialLoopRadius = 10.0;          // 欧氏距离阈值 (m)
+double spatialLoopFitnessThres = 0.1;     // 比 SC 回环更严格的 ICP fitness 阈值
+int spatialLoopMinSeparation = 50;        // 最少间隔关键帧数（排除近邻自匹配）
+
 // ------------------------- 输入缓存：回调只负责入队 -------------------------
 std::queue<nav_msgs::Odometry::ConstPtr> odometryBuf;
 std::queue<sensor_msgs::PointCloud2ConstPtr> fullResBuf;
@@ -1159,7 +1165,79 @@ void performSCLoopClosure(void)
     }
 } // performSCLoopClosure
 
-// 回环检测线程：固定频率运行 Scan Context 检测。
+// 空间近邻回环检测：利用里程计位姿的欧氏距离发现回环，绕过 SC，直接 ICP 验证。
+// SC 可能因视角变化漏掉回环，但空间近邻不会——里程计精度尚可就有效。
+void performSpatialLoopClosure(void)
+{
+    if (!useSpatialLoopClosure) return;
+
+    // 快照关键帧数量（加锁避免与 process_pg 的 push_back 数据竞争）
+    mKF.lock();
+    int kf_size = (int)keyframePoses.size();
+    mKF.unlock();
+
+    int curr_node_idx = kf_size - 1;
+    if (curr_node_idx < spatialLoopMinSeparation) return;
+
+    double radiusSq = spatialLoopRadius * spatialLoopRadius;
+    std::vector<std::pair<int, double>> neighbors; // (idx, distSq)
+
+    mKF.lock();
+    double cx = keyframePosesUpdated[curr_node_idx].x;
+    double cy = keyframePosesUpdated[curr_node_idx].y;
+    double cz = keyframePosesUpdated[curr_node_idx].z;
+    int searchEnd = curr_node_idx - spatialLoopMinSeparation;
+    for (int i = 0; i < searchEnd; i++) {
+        double dx = keyframePosesUpdated[i].x - cx;
+        double dy = keyframePosesUpdated[i].y - cy;
+        double dz = keyframePosesUpdated[i].z - cz;
+        double d2 = dx*dx + dy*dy + dz*dz;
+        if (d2 < radiusSq)
+            neighbors.push_back({i, d2});
+    }
+    mKF.unlock();
+
+    // 按距离排序（近的优先处理）
+    std::sort(neighbors.begin(), neighbors.end(),
+              [](const auto& a, const auto& b) { return a.second < b.second; });
+
+    int acceptedCount = 0;
+    const int MAX_SPATIAL_LOOPS_PER_CYCLE = 3; // 每次最多接受 3 个空间回环
+
+    for (const auto& [historyIdx, d2] : neighbors) {
+        if (acceptedCount >= MAX_SPATIAL_LOOPS_PER_CYCLE) break;
+
+        std::pair<int, int> loopPair(historyIdx, curr_node_idx);
+
+        // 去重
+        mBuf.lock();
+        bool alreadyDone = processedLoopPairs.count(loopPair) > 0;
+        mBuf.unlock();
+        if (alreadyDone) continue;
+
+        cout << "[Spatial Loop] Candidate: " << historyIdx << " ↔ " << curr_node_idx
+             << " (dist=" << sqrt(d2) << "m)" << endl;
+
+        // 直接跑 ICP，使用比 SC 回环更严格的 fitness 阈值
+        auto relative_pose_optional = doICPVirtualRelative(historyIdx, curr_node_idx, spatialLoopFitnessThres);
+        if (relative_pose_optional) {
+            gtsam::Pose3 relative_pose = relative_pose_optional.value();
+            mtxPosegraph.lock();
+            gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(historyIdx, curr_node_idx, relative_pose, robustLoopNoise));
+            writeEdge({historyIdx, curr_node_idx}, relative_pose, robustLoopNoise, edges_str);
+            mtxPosegraph.unlock();
+
+            mBuf.lock();
+            processedLoopPairs.insert(loopPair);
+            mBuf.unlock();
+
+            cout << "[Spatial Loop] Accepted: " << historyIdx << " ↔ " << curr_node_idx << endl;
+            acceptedCount++;
+        }
+    }
+} // performSpatialLoopClosure
+
+// 回环检测线程：固定频率运行 Scan Context + 空间近邻回环检测。
 void process_lcd(void)
 {
     float loopClosureFrequency = 1.0; // can change 
@@ -1168,7 +1246,7 @@ void process_lcd(void)
     {
         rate.sleep();
         performSCLoopClosure();
-        // performRSLoopClosure(); // TODO
+        performSpatialLoopClosure();
     }
 } // process_lcd
 
