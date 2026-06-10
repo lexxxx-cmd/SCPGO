@@ -344,17 +344,17 @@ std::pair<int, float> SCManager::detectLoopClosureID ( void )
     std::lock_guard<std::mutex> lock(mtxSC_);
     int loop_id { -1 }; // init with -1, -1 means no loop (== LeGO-LOAM's variable "closestHistoryFrameID")
 
-    auto curr_key = polarcontext_invkeys_mat_.back(); // current observation (query)
-    auto curr_desc = polarcontexts_.back(); // current observation (query)
-
-    /* 
+    /*
      * step 1: candidates from ringkey tree_
      */
     if( (int)polarcontext_invkeys_mat_.size() < NUM_EXCLUDE_RECENT + 1)
     {
         std::pair<int, float> result {loop_id, 0.0};
-        return result; // Early return 
+        return result; // Early return
     }
+
+    auto curr_key = polarcontext_invkeys_mat_.back(); // current observation (query)
+    auto curr_desc = polarcontexts_.back(); // current observation (query)
 
     // tree_ reconstruction (not mandatory to make everytime)
     if( tree_making_period_conter % TREE_MAKING_PERIOD_ == 0) // to save computation cost
