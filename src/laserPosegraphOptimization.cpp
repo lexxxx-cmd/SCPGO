@@ -11,6 +11,7 @@
 #include <string>
 #include <optional>
 #include <iomanip>
+#include <csignal>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -74,6 +75,23 @@ struct ScalarBinaryOpTraits {
 #include "SCPGO/aloam_velodyne/tic_toc.h"
 
 #include "SCPGO/scancontext/Scancontext.h"
+
+// ------------------------------------------------------------
+// 优雅退出标志与信号处理
+// 替代 ROS 默认的 SIGINT handler，完全由 main() 控制退出流程：
+// Ctrl+C/SIGTERM 只设置标志，不做 shutdown；等所有保存完成后才调 ros::shutdown()
+// ------------------------------------------------------------
+static std::atomic<bool> g_shutdown_requested{false};
+
+// 输入静默超时自动退出的心跳检测
+static std::atomic<double> g_last_input_time{0.0};   // 最后收到消息的 wall time (seconds)
+static std::atomic<bool>  g_has_received_input{false}; // 是否已收到过消息（防启动误判）
+
+static void gracefulShutdownHandler(int /*sig*/)
+{
+    g_shutdown_requested.store(true);
+    // 不调 ros::shutdown() —— 让 main() 先完成保存
+}
 
 using namespace gtsam;
 
@@ -339,6 +357,9 @@ void saveOptimizedVerticesTUMformat(gtsam::Values _estimates, const std::vector<
 // 里程计回调只做缓存，不在回调线程里做耗时计算。
 void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr &_laserOdometry)
 {
+    g_has_received_input.store(true);
+    g_last_input_time.store(ros::WallTime::now().toSec());
+
 	mBuf.lock();
 	odometryBuf.push(_laserOdometry);
 	mBuf.unlock();
@@ -911,9 +932,9 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
 // 主线程之一：消费里程计/点云/GPS 缓存，抽关键帧并构建初始位姿图。
 void process_pg()
 {
-    while(ros::ok())
+    while(!g_shutdown_requested.load())
     {
-		while ( ros::ok() && !odometryBuf.empty() && !fullResBuf.empty() )
+		while ( !g_shutdown_requested.load() && !odometryBuf.empty() && !fullResBuf.empty() )
         {
             //
             // pop and check keyframe is or not  
@@ -1240,11 +1261,16 @@ void performSpatialLoopClosure(void)
 // 回环检测线程：固定频率运行 Scan Context + 空间近邻回环检测。
 void process_lcd(void)
 {
-    float loopClosureFrequency = 1.0; // can change 
-    ros::Rate rate(loopClosureFrequency);
-    while (ros::ok())
+    float loopClosureFrequency = 1.0; // can change
+    ros::WallDuration cycleTime(1.0 / loopClosureFrequency);
+    while (!g_shutdown_requested.load())
     {
-        rate.sleep();
+        // 响应式 sleep：拆成 100ms 片段，每片段检查退出标志
+        ros::WallTime deadline = ros::WallTime::now() + cycleTime;
+        while (!g_shutdown_requested.load() && ros::WallTime::now() < deadline) {
+            ros::WallDuration(0.1).sleep();
+        }
+        if (g_shutdown_requested.load()) break;
         performSCLoopClosure();
         performSpatialLoopClosure();
     }
@@ -1253,9 +1279,9 @@ void process_lcd(void)
 // 回环 ICP 线程：把候选回环转换成精确的位姿约束。
 void process_icp(void)
 {
-    while(ros::ok())
+    while(!g_shutdown_requested.load())
     {
-		while ( ros::ok() && !scLoopICPBuf.empty() )
+		while ( !g_shutdown_requested.load() && !scLoopICPBuf.empty() )
         {
             if( scLoopICPBuf.size() > 30 ) {
                 ROS_WARN("Too many loop clousre candidates to be ICPed is waiting ... Do process_lcd less frequently (adjust loopClosureFrequency)");
@@ -1299,10 +1325,15 @@ void process_icp(void)
 // 轨迹可视化线程：高频发布优化后的路径。
 void process_viz_path(void)
 {
-    float hz = 10.0; 
-    ros::Rate rate(hz);
-    while (ros::ok()) {
-        rate.sleep();
+    float hz = 10.0;
+    ros::WallDuration cycleTime(1.0 / hz);
+    while (!g_shutdown_requested.load()) {
+        // 响应式 sleep：拆成 100ms 片段
+        ros::WallTime deadline = ros::WallTime::now() + cycleTime;
+        while (!g_shutdown_requested.load() && ros::WallTime::now() < deadline) {
+            ros::WallDuration(0.1).sleep();
+        }
+        if (g_shutdown_requested.load()) break;
         if(recentIdxUpdated.load() > 1) {
             pubPath();
         }
@@ -1312,10 +1343,15 @@ void process_viz_path(void)
 // 定时运行 iSAM2，并把最新优化结果导出到磁盘。
 void process_isam(void)
 {
-    float hz = 1; 
-    ros::Rate rate(hz);
-    while (ros::ok()) {
-        rate.sleep();
+    float hz = 1;
+    ros::WallDuration cycleTime(1.0 / hz);
+    while (!g_shutdown_requested.load()) {
+        // 响应式 sleep：拆成 100ms 片段
+        ros::WallTime deadline = ros::WallTime::now() + cycleTime;
+        while (!g_shutdown_requested.load() && ros::WallTime::now() < deadline) {
+            ros::WallDuration(0.1).sleep();
+        }
+        if (g_shutdown_requested.load()) break;
         if( gtSAMgraphMade ) {
             mtxPosegraph.lock();
             runISAM2opt();
@@ -1362,9 +1398,14 @@ void pubMap(void)
 void process_viz_map(void)
 {
     float vizmapFrequency = 0.1; // 0.1 means run onces every 10s
-    ros::Rate rate(vizmapFrequency);
-    while (ros::ok()) {
-        rate.sleep();
+    ros::WallDuration cycleTime(1.0 / vizmapFrequency);
+    while (!g_shutdown_requested.load()) {
+        // 响应式 sleep：拆成 100ms 片段
+        ros::WallTime deadline = ros::WallTime::now() + cycleTime;
+        while (!g_shutdown_requested.load() && ros::WallTime::now() < deadline) {
+            ros::WallDuration(0.1).sleep();
+        }
+        if (g_shutdown_requested.load()) break;
         if(recentIdxUpdated.load() > 1) {
             pubMap();
         }
@@ -1461,32 +1502,58 @@ void recoverAllPosesTUM(const std::string& _filename)
 // 程序入口：初始化 ROS、参数、线程，然后在退出时统一保存结果。
 int main(int argc, char **argv)
 {
-	ros::init(argc, argv, "laserPGO");
+    // 阻止 ROS 安装默认 SIGINT handler，由我们自己管理退出流程
+	ros::init(argc, argv, "laserPGO", ros::init_options::NoSigintHandler);
+	signal(SIGINT,  gracefulShutdownHandler);
+	signal(SIGTERM, gracefulShutdownHandler);
+
 	ros::NodeHandle nh;
 	ros::NodeHandle pnh("~");
 
 
     // ------------------------- 输出文件路径 -------------------------
-	nh.param<std::string>("save_directory", save_directory, "./"); // pose assignment every k m move 
+	pnh.param<std::string>("save_directory", save_directory, ""); // launch 文件传入，默认空串避免误写
 
     pgTUMformat = save_directory + "optimized_poses.txt";
     odomKITTIformat = save_directory + "odom_poses.txt";
 
     // pgG2oSaveStream = std::fstream(save_directory + "singlesession_posegraph.g2o", std::fstream::out);
 
-    pgTimeSaveStream = std::fstream(save_directory + "times.txt", std::fstream::out); 
+    pgTimeSaveStream = std::fstream(save_directory + "times.txt", std::fstream::out);
     pgTimeSaveStream.precision(std::numeric_limits<double>::max_digits10);
 
 
     // ------------------------- 算法参数：关键帧、回环、地图滤波 -------------------------
-	nh.param<double>("keyframe_meter_gap", keyframeMeterGap, 2.0); // pose assignment every k m move 
-	nh.param<double>("keyframe_deg_gap", keyframeDegGap, 10.0); // pose assignment every k deg rot 
+	pnh.param<double>("keyframe_meter_gap", keyframeMeterGap, 2.0); // pose assignment every k m move
+	pnh.param<double>("keyframe_deg_gap", keyframeDegGap, 10.0); // pose assignment every k deg rot
     keyframeRadGap = deg2rad(keyframeDegGap);
 
-	nh.param<double>("sc_dist_thres", scDistThres, 0.2);
-	nh.param<double>("sc_max_radius", scMaximumRadius, 80.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor
+	pnh.param<double>("sc_dist_thres", scDistThres, 0.2);
+	pnh.param<double>("sc_max_radius", scMaximumRadius, 80.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor
+	pnh.param<double>("sc_lidar_height", scManager.LIDAR_HEIGHT, 2.0);
 	pnh.param<bool>("use_ground_removal", useGroundRemoval, true);             // 是否启用 RANSAC 去地面
 	pnh.param<bool>("use_icp_submap_enhancement", useICPSubmapEnhancement, true); // 是否启用 ICP 子地图增强
+
+	// ICP 回环验证参数
+	pnh.param<double>("icp_max_correspondence_distance", icpMaxCorrespondenceDistance, 150.0);
+	pnh.param<double>("icp_fitness_score_threshold", icpFitnessScoreThreshold, 0.3);
+	pnh.param<int>("icp_min_source_points", icpMinSourcePoints, 50);
+	pnh.param<int>("icp_min_target_points", icpMinTargetPoints, 50);
+	pnh.param<double>("icp_max_translation", icpMaxTranslation, 50.0);
+	double icpMaxRotationDeg;
+	pnh.param<double>("icp_max_rotation_deg", icpMaxRotationDeg, 30.0);
+	icpMaxRotationRad = deg2rad(icpMaxRotationDeg);
+
+	// 回环鲁棒核函数参数
+	pnh.param<double>("loop_noise_score", loopNoiseScore, 0.5);
+	pnh.param<double>("loop_kernel_param", loopKernelParam, 1.0);
+	pnh.param<std::string>("loop_kernel_type", loopKernelType, std::string("geman_mcclure"));
+
+	// 空间近邻回环检测参数
+	pnh.param<bool>("use_spatial_loop_closure", useSpatialLoopClosure, true);
+	pnh.param<double>("spatial_loop_radius", spatialLoopRadius, 10.0);
+	pnh.param<double>("spatial_loop_fitness_thres", spatialLoopFitnessThres, 0.1);
+	pnh.param<int>("spatial_loop_min_separation", spatialLoopMinSeparation, 50);
 
     ISAM2Params parameters;
     parameters.relinearizeThreshold = 0.01;
@@ -1506,7 +1573,7 @@ int main(int argc, char **argv)
     downSizeFilterICP.setLeafSize(icp_filter_size, icp_filter_size, icp_filter_size);
 
     double mapVizFilterSize;
-	nh.param<double>("mapviz_filter_size", mapVizFilterSize, 0.4); // pose assignment every k frames 
+	pnh.param<double>("mapviz_filter_size", mapVizFilterSize, 0.4); // pose assignment every k frames
     downSizeFilterMapPGO.setLeafSize(mapVizFilterSize, mapVizFilterSize, mapVizFilterSize);
 
 
@@ -1531,16 +1598,39 @@ int main(int argc, char **argv)
 
     // ------------------------- 后台工作线程 -------------------------
     std::thread posegraph_slam {process_pg}; // pose graph construction
-	std::thread lc_detection {process_lcd}; // loop closure detection 
-	std::thread icp_calculation {process_icp}; // loop constraint calculation via icp 
-	std::thread isam_update {process_isam}; // if you want to call less isam2 run (for saving redundant computations and no real-time visulization is required), uncommment this and comment all the above runisam2opt when node is added. 
+	std::thread lc_detection {process_lcd}; // loop closure detection
+	std::thread icp_calculation {process_icp}; // loop constraint calculation via icp
+	std::thread isam_update {process_isam}; // if you want to call less isam2 run (for saving redundant computations and no real-time visulization is required), uncommment this and comment all the above runisam2opt when node is added.
 
 	std::thread viz_map {process_viz_map}; // visualization - map (low frequency because it is heavy)
 	std::thread viz_path {process_viz_path}; // visualization - path (high frequency)
 
- 	ros::spin();
+    // 输入静默超时：rosbag 播完后无新消息，自动触发保存退出
+    double inputSilenceTimeout;
+    pnh.param<double>("input_silence_timeout", inputSilenceTimeout, 8.0);
 
-	// 退出后先等待所有线程结束，再统一保存最终结果。
+    // 用 spinOnce 循环替代 ros::spin()：既可响应 Ctrl+C，也可自动检测输入静默
+    ros::Rate spinRate(100); // 100 Hz
+    while (!g_shutdown_requested.load())
+    {
+        ros::spinOnce();
+        spinRate.sleep();
+
+        // 输入静默检测：超过阈值无新消息 → 认为数据源结束 → 自动保存退出
+        if (inputSilenceTimeout > 0.0 &&
+            g_has_received_input.load() &&
+            (ros::WallTime::now().toSec() - g_last_input_time.load()) > inputSilenceTimeout)
+        {
+            const double elapsed = ros::WallTime::now().toSec() - g_last_input_time.load();
+            ROS_INFO("No input for %.0f sec (> %.0f sec timeout) -- data source likely ended. Auto-saving...",
+                     elapsed, inputSilenceTimeout);
+            g_shutdown_requested.store(true);
+        }
+    }
+
+    ROS_INFO("Shutdown triggered. Stopping processing threads...");
+
+    // 先等待所有线程结束（最多 300ms，因为长 sleep 都拆成了 100ms 片段）
     posegraph_slam.join();
     lc_detection.join();
     icp_calculation.join();
@@ -1548,14 +1638,24 @@ int main(int argc, char **argv)
     viz_map.join();
     viz_path.join();
 
-    // save final results
+    ROS_INFO("All threads stopped. Saving final results -- DO NOT INTERRUPT...");
+
+    // 保存最终结果 —— 全部完成后才退出
+    ROS_INFO("  [1/5] Saving optimized poses (TUM)...");
     saveOptimizedVerticesTUMformat(isamCurrentEstimate, keyframeTimes, pgTUMformat);
+    ROS_INFO("  [2/5] Saving odometry poses (KITTI)...");
     saveOdometryVerticesKITTIformat(odomKITTIformat);
+    ROS_INFO("  [3/5] Saving pose graph (g2o)...");
     saveGTSAMgraphG2oFormat(isamCurrentEstimate);
+    ROS_INFO("  [4/5] Saving global map (PCD)...");
     saveGlobalMap(save_directory + "global_map.pcd");
+    ROS_INFO("  [5/5] Recovering all poses (TUM)...");
     recoverAllPosesTUM(save_directory + "all_optimized_poses.txt");
 
     pgTimeSaveStream.close();
 
-	return 0;
+    ROS_INFO("All saves complete. Shutting down cleanly.");
+    ros::shutdown();
+
+    return 0;
 }
