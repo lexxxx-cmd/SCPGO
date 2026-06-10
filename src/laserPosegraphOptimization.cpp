@@ -110,6 +110,11 @@ const double GROUND_Z_MARGIN = 0.15;     // 裁剪容差（m），低于 estimat
 bool useGroundRemoval = true;            // nh.param 开关：是否启用 RANSAC 去地面
 bool useICPSubmapEnhancement = true;     // nh.param 开关：是否启用 ICP 子地图增强（滑动窗口+空间近邻）
 
+// 回环鲁棒核函数参数（从 launch 文件读取）
+double loopNoiseScore = 0.5;       // 回环噪声方差（越小越信任回环）
+double loopKernelParam = 1.0;      // 鲁棒核参数 k（越小越激进拒绝异常值）
+std::string loopKernelType = "geman_mcclure"; // cauchy / dcs / geman_mcclure
+
 // ------------------------- 输入缓存：回调只负责入队 -------------------------
 std::queue<nav_msgs::Odometry::ConstPtr> odometryBuf;
 std::queue<sensor_msgs::PointCloud2ConstPtr> fullResBuf;
@@ -206,16 +211,39 @@ std::string getVertexStr(const int _node_idx, const gtsam::Pose3& _Pose)
 }
 
 // 把两帧之间的相对位姿写成 g2o 需要的 EDGE_SE3:QUAT 文本行。
-void writeEdge(const std::pair<int, int> _node_idx_pair, const gtsam::Pose3& _relPose, std::vector<std::string>& edges_str)
+void writeEdge(const std::pair<int, int> _node_idx_pair, const gtsam::Pose3& _relPose,
+               const gtsam::noiseModel::Base::shared_ptr& _noise,
+               std::vector<std::string>& edges_str)
 {
     gtsam::Point3 t = _relPose.translation();
     gtsam::Rot3 R = _relPose.rotation();
 
     std::string curEdgeInfo {
         "EDGE_SE3:QUAT " + std::to_string(_node_idx_pair.first) + " " + std::to_string(_node_idx_pair.second) + " "
-        + std::to_string(t.x()) + " " + std::to_string(t.y()) + " " + std::to_string(t.z())  + " " 
-        + std::to_string(R.toQuaternion().x()) + " " + std::to_string(R.toQuaternion().y()) + " " 
+        + std::to_string(t.x()) + " " + std::to_string(t.y()) + " " + std::to_string(t.z())  + " "
+        + std::to_string(R.toQuaternion().x()) + " " + std::to_string(R.toQuaternion().y()) + " "
         + std::to_string(R.toQuaternion().z()) + " " + std::to_string(R.toQuaternion().w()) };
+
+    // 提取底层 Diagonal 噪声模型，写入 6×6 上三角信息矩阵（21 个值）
+    const gtsam::noiseModel::Diagonal* diagPtr = nullptr;
+    if (_noise) {
+        auto* robust = dynamic_cast<gtsam::noiseModel::Robust*>(_noise.get());
+        if (robust) {
+            diagPtr = dynamic_cast<gtsam::noiseModel::Diagonal*>(robust->noise().get());
+        } else {
+            diagPtr = dynamic_cast<gtsam::noiseModel::Diagonal*>(_noise.get());
+        }
+    }
+
+    if (diagPtr) {
+        Eigen::VectorXd sigmas = diagPtr->sigmas();
+        for (int i = 0; i < 6; i++) {
+            curEdgeInfo += " " + std::to_string(1.0 / (sigmas(i) * sigmas(i)));
+            for (int j = i + 1; j < 6; j++) {
+                curEdgeInfo += " 0";
+            }
+        }
+    }
 
     // pgEdgeSaveStream << curEdgeInfo << std::endl;
     edges_str.emplace_back(curEdgeInfo);
@@ -234,7 +262,7 @@ void saveGTSAMgraphG2oFormat(const gtsam::Values& _estimates)
     // cout << "****************************************************" << endl; 
     cout << "Saving the posegraph ..." << endl; // giseop
 
-    pgG2oSaveStream = std::fstream(save_directory + "singlesession_posegraph.g2o", std::fstream::out);
+    pgG2oSaveStream = std::fstream(save_directory + "gragh.g2o", std::fstream::out);
 
     int pose_idx = 0;
     for(const auto& _pose6d: keyframePoses) {
@@ -331,12 +359,24 @@ void initNoises( void )
     odomNoiseVector6 << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4;
     odomNoise = noiseModel::Diagonal::Variances(odomNoiseVector6);
 
-    double loopNoiseScore = 0.5; // constant is ok...
+    // 回环噪声：方差 + 鲁棒核函数（可从 launch 文件调节）
     gtsam::Vector robustNoiseVector6(6); // gtsam::Pose3 factor has 6 elements (6D)
-    robustNoiseVector6 << loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore;
-    robustLoopNoise = gtsam::noiseModel::Robust::Create(
-                    gtsam::noiseModel::mEstimator::Cauchy::Create(1), // optional: replacing Cauchy by DCS or GemanMcClure is okay but Cauchy is empirically good.
-                    gtsam::noiseModel::Diagonal::Variances(robustNoiseVector6) );
+    robustNoiseVector6 << loopNoiseScore, loopNoiseScore, loopNoiseScore,
+                          loopNoiseScore, loopNoiseScore, loopNoiseScore;
+
+    auto baseNoise = gtsam::noiseModel::Diagonal::Variances(robustNoiseVector6);
+
+    if (loopKernelType == "geman_mcclure") {
+        robustLoopNoise = gtsam::noiseModel::Robust::Create(
+            gtsam::noiseModel::mEstimator::GemanMcClure::Create(loopKernelParam), baseNoise);
+    } else if (loopKernelType == "dcs") {
+        robustLoopNoise = gtsam::noiseModel::Robust::Create(
+            gtsam::noiseModel::mEstimator::DCS::Create(loopKernelParam), baseNoise);
+    } else {
+        // 默认 fallback 到 Cauchy（与原行为一致）
+        robustLoopNoise = gtsam::noiseModel::Robust::Create(
+            gtsam::noiseModel::mEstimator::Cauchy::Create(loopKernelParam), baseNoise);
+    }
 
     double bigNoiseTolerentToXY = 1000000000.0; // 1e9
     double gpsAltitudeNoiseScore = 250.0; // if height is misaligned after loop clsosing, use this value bigger
@@ -989,8 +1029,7 @@ void process_pg()
                         cout << "GPS factor added at node " << curr_node_idx << endl;
                     }
                     initialEstimate.insert(curr_node_idx, poseTo);                
-                    writeEdge({prev_node_idx, curr_node_idx}, relPose, edges_str); // giseop
-                    // runISAM2opt();
+                    writeEdge({prev_node_idx, curr_node_idx}, relPose, odomNoise, edges_str); // giseop
                 }
                 mtxPosegraph.unlock();
 
@@ -1086,7 +1125,7 @@ void process_icp(void)
                 gtsam::Pose3 relative_pose = relative_pose_optional.value();
                 mtxPosegraph.lock();
                 gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, relative_pose, robustLoopNoise));
-                writeEdge({prev_node_idx, curr_node_idx}, relative_pose, edges_str); // giseop
+                writeEdge({prev_node_idx, curr_node_idx}, relative_pose, robustLoopNoise, edges_str); // giseop
                 mtxPosegraph.unlock();
 
                 // 记录已处理，防止后续重复检测
