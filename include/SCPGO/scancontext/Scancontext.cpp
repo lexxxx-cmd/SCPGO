@@ -231,12 +231,14 @@ MatrixXd SCManager::makeSectorkeyFromScancontext( Eigen::MatrixXd &_desc )
 
 const Eigen::MatrixXd& SCManager::getConstRefRecentSCD(void)
 {
+    std::lock_guard<std::mutex> lock(mtxSC_);
     return polarcontexts_.back();
 }
 
 
 void SCManager::saveScancontextAndKeys( Eigen::MatrixXd _scd )
 {
+    std::lock_guard<std::mutex> lock(mtxSC_);
     Eigen::MatrixXd ringkey = makeRingkeyFromScancontext( _scd );
     Eigen::MatrixXd sectorkey = makeSectorkeyFromScancontext( _scd );
     std::vector<float> polarcontext_invkey_vec = eig2stdvec( ringkey );
@@ -250,7 +252,8 @@ void SCManager::saveScancontextAndKeys( Eigen::MatrixXd _scd )
 
 void SCManager::makeAndSaveScancontextAndKeys( pcl::PointCloud<SCPointType> & _scan_down )
 {
-    Eigen::MatrixXd sc = makeScancontext(_scan_down); // v1 
+    std::lock_guard<std::mutex> lock(mtxSC_);
+    Eigen::MatrixXd sc = makeScancontext(_scan_down); // v1
     Eigen::MatrixXd ringkey = makeRingkeyFromScancontext( sc );
     Eigen::MatrixXd sectorkey = makeSectorkeyFromScancontext( sc );
     std::vector<float> polarcontext_invkey_vec = eig2stdvec( ringkey );
@@ -273,6 +276,7 @@ void SCManager::setMaximumRadius(double _max_r)
 
 std::pair<int, float> SCManager::detectLoopClosureIDBetweenSession (std::vector<float>& _curr_key, Eigen::MatrixXd& _curr_desc)
 {
+    std::lock_guard<std::mutex> lock(mtxSC_);
     int loop_id { -1 }; // init with -1, -1 means no loop (== LeGO-LOAM's variable "closestHistoryFrameID")
 
     auto& curr_key = _curr_key;
@@ -337,6 +341,7 @@ std::pair<int, float> SCManager::detectLoopClosureIDBetweenSession (std::vector<
 
 std::pair<int, float> SCManager::detectLoopClosureID ( void )
 {
+    std::lock_guard<std::mutex> lock(mtxSC_);
     int loop_id { -1 }; // init with -1, -1 means no loop (== LeGO-LOAM's variable "closestHistoryFrameID")
 
     auto curr_key = polarcontext_invkeys_mat_.back(); // current observation (query)

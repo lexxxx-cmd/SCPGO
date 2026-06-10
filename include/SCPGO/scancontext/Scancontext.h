@@ -5,10 +5,11 @@
 #include <cmath>
 #include <utility>
 #include <vector>
-#include <algorithm> 
+#include <algorithm>
 #include <cstdlib>
 #include <memory>
 #include <iostream>
+#include <mutex>
 
 #include <Eigen/Dense>
 
@@ -107,7 +108,8 @@ public:
     void setSCdistThres(double _new_thres);
     void setMaximumRadius(double _max_r);
 
-    // data 
+    // data
+    std::mutex mtxSC_; // protects polarcontexts_ / polarcontext_invkeys_ / polarcontext_vkeys_ / polarcontext_invkeys_mat_
     std::vector<double> polarcontexts_timestamp_; // optional.
     std::vector<Eigen::MatrixXd> polarcontexts_;
     std::vector<Eigen::MatrixXd> polarcontext_invkeys_;
