@@ -162,6 +162,15 @@ SCManager scManager;
 double scDistThres, scMaximumRadius;
 
 pcl::VoxelGrid<PointType> downSizeFilterICP;
+
+// ICP 回环验证参数（从 launch 文件读取）
+double icpMaxCorrespondenceDistance;
+double icpFitnessScoreThreshold;
+int icpMinSourcePoints;
+int icpMinTargetPoints;
+double icpMaxTranslation;
+double icpMaxRotationRad; // 内部使用弧度
+
 std::mutex mtxPosegraph;
 std::mutex mtxRecentPose;
 
@@ -602,7 +611,7 @@ void pubPath( void )
     q.setY(odomAftPGO.pose.pose.orientation.y);
     q.setZ(odomAftPGO.pose.pose.orientation.z);
     transform.setRotation(q);
-    br.sendTransform(tf::StampedTransform(transform, odomAftPGO.header.stamp, "camera_init", "aft_pgo"));
+    br.sendTransform(tf::StampedTransform(transform, ros::Time::now(), "camera_init", "aft_pgo"));
 } // pubPath
 
 // 用 iSAM2 的最新估计回填关键帧位姿，并更新最近优化位姿缓存。
@@ -702,8 +711,9 @@ void loopFindNearKeyframesCloud( pcl::PointCloud<PointType>::Ptr& nearKeyframes,
 
 
 // 用 ICP 估计回环两端的精确相对位姿；失败则返回空值。
-std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx )
+std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx, double _fitness_threshold = -1.0 )
 {
+    double effectiveFitnessThres = (_fitness_threshold >= 0.0) ? _fitness_threshold : icpFitnessScoreThreshold;
     // parse pointclouds
     int historyKeyframeSearchNum = 25; // enough. ex. [-25, 25] covers submap length of 50x1 = 50m if every kf gap is 1m
     pcl::PointCloud<PointType>::Ptr cureKeyframeCloud(new pcl::PointCloud<PointType>());
@@ -729,23 +739,36 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
         // ---- 历史帧子地图：时间窗口 ±25 + 空间近邻（15m 半径） ----
         loopFindNearKeyframesCloud(targetKeyframeCloud, _loop_kf_idx, historyKeyframeSearchNum, _loop_kf_idx);
 
-        // 空间近邻：暴力搜索 15m 半径内的历史关键帧，合并到 target submap
+        // 空间近邻：暴力搜索 5m 半径内的历史关键帧，合并到 target submap
         {
-            const double spatialRadius = 15.0;
+            const double spatialRadius = 5.0;
             const double spatialRadiusSq = spatialRadius * spatialRadius;
-            Pose6D& loopPose = keyframePosesUpdated[_loop_kf_idx];
-            for (int i = 0; i < int(keyframeLaserClouds.size()); ++i) {
+            // 值拷贝位姿（加锁避免 push_back 导致的引用悬空）
+            mKF.lock();
+            Pose6D loopPose = keyframePosesUpdated[_loop_kf_idx];
+            int numClouds = (int)keyframeLaserClouds.size();
+            mKF.unlock();
+
+            for (int i = 0; i < numClouds; ++i) {
                 // 跳过已在时间窗口内的帧，避免重复合并
                 if (std::abs(i - _loop_kf_idx) <= historyKeyframeSearchNum)
                     continue;
-                Pose6D& pose_i = keyframePosesUpdated[i];
+
+                mKF.lock();
+                if (i >= (int)keyframeLaserClouds.size()) { mKF.unlock(); continue; }
+                Pose6D pose_i = keyframePosesUpdated[i];
+                mKF.unlock();
+
                 double dx = pose_i.x - loopPose.x;
                 double dy = pose_i.y - loopPose.y;
                 double dz = pose_i.z - loopPose.z;
                 double distSq = dx*dx + dy*dy + dz*dz;
                 if (distSq < spatialRadiusSq) {
                     mKF.lock();
-                    *targetKeyframeCloud += *local2global(keyframeLaserClouds[i], keyframePosesUpdated[i]);
+                    // 二次 bounds check：防止 unlock 期间 vector 被 reallocated
+                    if (i < (int)keyframeLaserClouds.size()) {
+                        *targetKeyframeCloud += *local2global(keyframeLaserClouds[i], keyframePosesUpdated[i]);
+                    }
                     mKF.unlock();
                 }
             }
@@ -774,9 +797,19 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
     targetKeyframeCloudMsg.header.frame_id = "camera_init";
     pubLoopSubmapLocal.publish(targetKeyframeCloudMsg);
 
+    // ---- 点数预检：source 和 target 必须有足够的点 ----
+    int sourcePts = (int)cureKeyframeCloud->size();
+    int targetPts = (int)targetKeyframeCloud->size();
+    if (sourcePts < icpMinSourcePoints || targetPts < icpMinTargetPoints) {
+        cout << "[ICP] Reject: too few points (source=" << sourcePts
+             << " < " << icpMinSourcePoints << " or target=" << targetPts
+             << " < " << icpMinTargetPoints << ")" << endl;
+        return std::nullopt;
+    }
+
     // ICP Settings
     pcl::IterativeClosestPoint<PointType, PointType> icp;
-    icp.setMaxCorrespondenceDistance(150); // giseop , use a value can cover 2*historyKeyframeSearchNum range in meter
+    icp.setMaxCorrespondenceDistance(icpMaxCorrespondenceDistance);
     icp.setMaximumIterations(100);
     icp.setTransformationEpsilon(1e-6);
     icp.setEuclideanFitnessEpsilon(1e-6);
@@ -788,14 +821,73 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
     pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
     icp.align(*unused_result);
 
-    float loopFitnessScoreThreshold = 0.3; // user parameter but fixed low value is safe.
-    if (icp.hasConverged() == false || icp.getFitnessScore() > loopFitnessScoreThreshold) {
-        std::cout << "[SC loop] ICP fitness test failed (" << icp.getFitnessScore() << " > " << loopFitnessScoreThreshold << "). Reject this SC loop." << std::endl;
+    // ---- 校验 1: ICP 收敛 + fitness score ----
+    if (icp.hasConverged() == false || icp.getFitnessScore() > effectiveFitnessThres) {
+        cout << "[ICP] Reject: fitness " << icp.getFitnessScore()
+             << " > " << effectiveFitnessThres << endl;
         return std::nullopt;
-    } else {
-        std::cout << "[SC loop] ICP fitness test passed (" << icp.getFitnessScore() << " < " << loopFitnessScoreThreshold << "). Add this SC loop." << std::endl;
+    }
 
-        // 发布经过 ICP 验证的成功匹配回环关键帧（ICP 配准后位置）和历史回环子地图
+    // ---- 校验 2: ICP 修正量几何合理性 ----
+    {
+        float x, y, z, roll, pitch, yaw;
+        Eigen::Affine3f correctionLidarFrame(icp.getFinalTransformation());
+        pcl::getTranslationAndEulerAngles(correctionLidarFrame, x, y, z, roll, pitch, yaw);
+
+        double transMag = sqrt(x*x + y*y + z*z);
+        double rotMag = sqrt(roll*roll + pitch*pitch + yaw*yaw); // 欧拉角范数近似旋转量
+
+        if (transMag > icpMaxTranslation || rotMag > icpMaxRotationRad) {
+            cout << "[ICP] Reject: correction too large (trans=" << transMag
+                 << "m max=" << icpMaxTranslation
+                 << "m, rot=" << rad2deg(rotMag)
+                 << "° max=" << rad2deg(icpMaxRotationRad) << "°)" << endl;
+            return std::nullopt;
+        }
+
+        // ---- 校验 3: ICP 修正后与里程计预测的一致性 ----
+        // 链式里程计预测相对位姿 (loop→curr)
+        gtsam::Pose3 odomPredicted = Pose6DtoGTSAMPose3(keyframePoses[_loop_kf_idx]);
+        for (int i = _loop_kf_idx + 1; i <= _curr_kf_idx; ++i) {
+            gtsam::Pose3 from = Pose6DtoGTSAMPose3(keyframePoses[i-1]);
+            gtsam::Pose3 to   = Pose6DtoGTSAMPose3(keyframePoses[i]);
+            gtsam::Pose3 delta = from.between(to);
+            odomPredicted = odomPredicted.compose(delta);
+        }
+        gtsam::Pose3 odomRelative = Pose6DtoGTSAMPose3(keyframePoses[_loop_kf_idx])
+                                    .between(odomPredicted);
+
+        // ICP 相对位姿
+        gtsam::Pose3 poseLoop = Pose6DtoGTSAMPose3(keyframePosesUpdated[_loop_kf_idx]);
+        gtsam::Pose3 poseCurr = Pose6DtoGTSAMPose3(keyframePosesUpdated[_curr_kf_idx]);
+        gtsam::Pose3 T_icp = gtsam::Pose3(gtsam::Rot3::RzRyRx(roll, pitch, yaw),
+                                           gtsam::Point3(x, y, z));
+        gtsam::Pose3 poseCurrCorrected = T_icp.compose(poseCurr);
+        gtsam::Pose3 icpRelative = poseLoop.between(poseCurrCorrected);
+
+        // 比较 odom 预测 vs ICP 结果
+        gtsam::Pose3 consistencyCheck = odomRelative.between(icpRelative);
+        double consistencyTrans = consistencyCheck.translation().norm();
+        double consistencyRot = gtsam::Rot3::Logmap(consistencyCheck.rotation()).norm();
+
+        const double MAX_CONSISTENCY_TRANS = icpMaxTranslation * 0.8;  // 一致性平移阈值
+        const double MAX_CONSISTENCY_ROT   = icpMaxRotationRad * 0.8;  // 一致性旋转阈值
+
+        if (consistencyTrans > MAX_CONSISTENCY_TRANS || consistencyRot > MAX_CONSISTENCY_ROT) {
+            cout << "[ICP] Reject: inconsistent with odometry (trans_diff=" << consistencyTrans
+                 << "m max=" << MAX_CONSISTENCY_TRANS
+                 << "m, rot_diff=" << rad2deg(consistencyRot)
+                 << "° max=" << rad2deg(MAX_CONSISTENCY_ROT) << "°)" << endl;
+            return std::nullopt;
+        }
+
+        cout << "[ICP] Passed: fitness=" << icp.getFitnessScore()
+             << ", corr_trans=" << transMag << "m"
+             << ", corr_rot=" << rad2deg(rotMag) << "°"
+             << ", consistency_trans=" << consistencyTrans << "m"
+             << ", consistency_rot=" << rad2deg(consistencyRot) << "°" << endl;
+
+        // 发布经过 ICP 验证的成功匹配回环关键帧
         sensor_msgs::PointCloud2 loopScanIcpMsg;
         pcl::toROSMsg(*unused_result, loopScanIcpMsg);
         loopScanIcpMsg.header.frame_id = "camera_init";
@@ -805,24 +897,9 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
         pcl::toROSMsg(*targetKeyframeCloud, loopSubmapIcpMsg);
         loopSubmapIcpMsg.header.frame_id = "camera_init";
         pubLoopSubmapIcp.publish(loopSubmapIcpMsg);
+
+        return icpRelative;
     }
-
-    // Get pose transformation
-    float x, y, z, roll, pitch, yaw;
-    Eigen::Affine3f correctionLidarFrame;
-    correctionLidarFrame = icp.getFinalTransformation();
-    pcl::getTranslationAndEulerAngles (correctionLidarFrame, x, y, z, roll, pitch, yaw);
-
-    // After submap fix (each keyframe uses its own pose in local2global),
-    // both clouds are at their true global positions. T_icp is a global correction.
-    // Compute the real relative pose: P_loop.between(T_icp * P_curr)
-    // 先把当前帧通过 ICP 校正到全局系，再和历史帧做 between，得到真正可加入图优化的相对约束。
-    gtsam::Pose3 poseLoop = Pose6DtoGTSAMPose3(keyframePosesUpdated[_loop_kf_idx]);
-    gtsam::Pose3 poseCurr = Pose6DtoGTSAMPose3(keyframePosesUpdated[_curr_kf_idx]);
-    gtsam::Pose3 T_icp = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
-    gtsam::Pose3 poseCurrCorrected = T_icp.compose(poseCurr);
-
-    return poseLoop.between(poseCurrCorrected);
 } // doICPVirtualRelative
 
 // 主线程之一：消费里程计/点云/GPS 缓存，抽关键帧并构建初始位姿图。
