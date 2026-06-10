@@ -13,6 +13,9 @@
 #include <iomanip>
 #include <csignal>
 
+#include <boost/format.hpp>
+#include <boost/filesystem.hpp>
+
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/search/impl/search.hpp>
@@ -225,6 +228,11 @@ std::string odomKITTIformat;
 std::fstream pgG2oSaveStream, pgTimeSaveStream;
 
 std::vector<std::string> edges_str; // used in writeEdge
+
+// ------------------------- 关键帧保存开关与配置 -------------------------
+bool saveKeyframesEnabled = false;       // nh.param 开关
+std::string saveKeyframesDirectory = ""; // 输出根目录
+bool saveKeyframesFullCloud = true;      // 是否保存全分辨率点云 (raw.pcd)
 
 // 把 gtsam::Pose3 转成 g2o 需要的 VERTEX_SE3:QUAT 文本行。
 std::string getVertexStr(const int _node_idx, const gtsam::Pose3& _Pose)
@@ -1433,6 +1441,56 @@ void saveGlobalMap(const std::string& _filename)
     cout << "Global map saved: " << _filename << " (" << filtered->size() << " points)" << endl;
 } // saveGlobalMap
 
+// 将每个关键帧的点云、位姿与元数据保存为与 interactive_slam 兼容的目录结构。
+void saveKeyframes(void)
+{
+    if (!saveKeyframesEnabled || saveKeyframesDirectory.empty()) return;
+
+    std::string kf_root = saveKeyframesDirectory + "/keyframes/";
+    boost::filesystem::create_directories(kf_root);
+
+    mKF.lock();
+    size_t n = std::min({keyframeLaserClouds.size(),
+                         keyframePosesUpdated.size(),
+                         keyframeTimes.size()});
+
+    for (size_t i = 0; i < n; i++) {
+        std::string kf_dir = (boost::format("%s/%06d") % kf_root % i).str();
+        boost::filesystem::create_directories(kf_dir);
+
+        // cloud.pcd (降采样)
+        pcl::io::savePCDFileBinary(kf_dir + "/cloud.pcd", *keyframeLaserClouds[i]);
+
+        // raw.pcd (全分辨率，可选)
+        if (saveKeyframesFullCloud && i < keyframeLaserCloudsFull.size()) {
+            pcl::io::savePCDFileBinary(kf_dir + "/raw.pcd", *keyframeLaserCloudsFull[i]);
+        }
+
+        // data 元数据
+        std::ofstream ofs(kf_dir + "/data");
+        if (!ofs) continue;
+
+        // 时间戳：double seconds → sec + usec
+        double t = keyframeTimes[i];
+        unsigned long sec  = static_cast<unsigned long>(std::floor(t));
+        unsigned long usec = static_cast<unsigned long>((t - sec) * 1e6);
+
+        ofs << "stamp " << sec << " " << usec << std::endl;
+
+        // estimate + odom: 统一使用优化后位姿
+        const Pose6D& pose = keyframePosesUpdated[i];
+        Eigen::Affine3f T = pcl::getTransformation(pose.x, pose.y, pose.z,
+                                                   pose.roll, pose.pitch, pose.yaw);
+        ofs << "estimate" << std::endl << T.matrix() << std::endl;
+        ofs << "odom " << std::endl << T.matrix() << std::endl;
+
+        ofs << "id " << i << std::endl;
+    }
+    mKF.unlock();
+
+    cout << "Keyframes saved: " << n << " nodes → " << kf_root << endl;
+} // saveKeyframes
+
 void recoverAllPosesTUM(const std::string& _filename)
 {
     if (allFrameTimestamps.empty() || keyframePosesUpdated.empty()) return;
@@ -1513,6 +1571,9 @@ int main(int argc, char **argv)
 
     // ------------------------- 输出文件路径 -------------------------
 	pnh.param<std::string>("save_directory", save_directory, ""); // launch 文件传入，默认空串避免误写
+	pnh.param<bool>("save_keyframes", saveKeyframesEnabled, false);
+	pnh.param<std::string>("save_keyframes_directory", saveKeyframesDirectory, "");
+	pnh.param<bool>("save_keyframes_full_cloud", saveKeyframesFullCloud, true);
 
     pgTUMformat = save_directory + "optimized_poses.txt";
     odomKITTIformat = save_directory + "odom_poses.txt";
@@ -1641,15 +1702,17 @@ int main(int argc, char **argv)
     ROS_INFO("All threads stopped. Saving final results -- DO NOT INTERRUPT...");
 
     // 保存最终结果 —— 全部完成后才退出
-    ROS_INFO("  [1/5] Saving optimized poses (TUM)...");
+    ROS_INFO("  [1/6] Saving optimized poses (TUM)...");
     saveOptimizedVerticesTUMformat(isamCurrentEstimate, keyframeTimes, pgTUMformat);
-    ROS_INFO("  [2/5] Saving odometry poses (KITTI)...");
+    ROS_INFO("  [2/6] Saving odometry poses (KITTI)...");
     saveOdometryVerticesKITTIformat(odomKITTIformat);
-    ROS_INFO("  [3/5] Saving pose graph (g2o)...");
+    ROS_INFO("  [3/6] Saving pose graph (g2o)...");
     saveGTSAMgraphG2oFormat(isamCurrentEstimate);
-    ROS_INFO("  [4/5] Saving global map (PCD)...");
+    ROS_INFO("  [4/6] Saving global map (PCD)...");
     saveGlobalMap(save_directory + "global_map.pcd");
-    ROS_INFO("  [5/5] Recovering all poses (TUM)...");
+    ROS_INFO("  [5/6] Saving keyframes...");
+    saveKeyframes();
+    ROS_INFO("  [6/6] Recovering all poses (TUM)...");
     recoverAllPosesTUM(save_directory + "all_optimized_poses.txt");
 
     pgTimeSaveStream.close();
