@@ -274,6 +274,11 @@ void SCManager::setMaximumRadius(double _max_r)
     PC_MAX_RADIUS = _max_r;
 } // SCManager::setMaximumRadius
 
+void SCManager::setLidarHeight(double _new_height)
+{
+    LIDAR_HEIGHT = _new_height;
+} // SCManager::setLidarHeight
+
 std::pair<int, float> SCManager::detectLoopClosureIDBetweenSession (std::vector<float>& _curr_key, Eigen::MatrixXd& _curr_desc)
 {
     std::lock_guard<std::mutex> lock(mtxSC_);
