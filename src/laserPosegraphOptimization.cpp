@@ -3,7 +3,9 @@
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <atomic>
 #include <queue>
+#include <set>
 #include <thread>
 #include <iostream>
 #include <string>
@@ -113,6 +115,7 @@ std::queue<nav_msgs::Odometry::ConstPtr> odometryBuf;
 std::queue<sensor_msgs::PointCloud2ConstPtr> fullResBuf;
 std::queue<sensor_msgs::NavSatFix::ConstPtr> gpsBuf;
 std::queue<std::pair<int, int> > scLoopICPBuf;
+std::set<std::pair<int, int>> processedLoopPairs; // 已处理的回环对，防止重复添加
 
 std::mutex mBuf;
 std::mutex mKF;
@@ -130,7 +133,7 @@ std::vector<pcl::PointCloud<PointType>::Ptr> keyframeLaserCloudsFull;
 std::vector<Pose6D> keyframePoses;
 std::vector<Pose6D> keyframePosesUpdated;
 std::vector<double> keyframeTimes;
-int recentIdxUpdated = 0;
+std::atomic<int> recentIdxUpdated{0};
 
 // 所有原始帧的里程计位姿与时间，用于恢复完整轨迹。
 std::vector<Pose6D> allFrameOdomPoses;
@@ -154,7 +157,6 @@ SCManager scManager;
 double scDistThres, scMaximumRadius;
 
 pcl::VoxelGrid<PointType> downSizeFilterICP;
-std::mutex mtxICP;
 std::mutex mtxPosegraph;
 std::mutex mtxRecentPose;
 
@@ -524,7 +526,7 @@ void pubPath( void )
     pathAftPGO.header.frame_id = "camera_init";
     mKF.lock(); 
     // for (int node_idx=0; node_idx < int(keyframePosesUpdated.size()) - 1; node_idx++) // -1 is just delayed visualization (because sometimes mutexed while adding(push_back) a new one)
-    for (int node_idx=0; node_idx < recentIdxUpdated; node_idx++) // -1 is just delayed visualization (because sometimes mutexed while adding(push_back) a new one)
+    for (int node_idx=0; node_idx < recentIdxUpdated.load(); node_idx++) // -1 is just delayed visualization (because sometimes mutexed while adding(push_back) a new one)
     {
         const Pose6D& pose_est = keyframePosesUpdated.at(node_idx); // upodated poses
         // const gtsam::Pose3& pose_est = isamCurrentEstimate.at<gtsam::Pose3>(node_idx);
@@ -577,6 +579,7 @@ void updatePoses(void)
         p.pitch = isamCurrentEstimate.at<gtsam::Pose3>(node_idx).rotation().pitch();
         p.yaw = isamCurrentEstimate.at<gtsam::Pose3>(node_idx).rotation().yaw();
     }
+    int kfUpdatedSize = (int)keyframePosesUpdated.size(); // 在 mKF 锁内捕获，避免数据竞争
     mKF.unlock();
 
     mtxRecentPose.lock();
@@ -584,7 +587,7 @@ void updatePoses(void)
     recentOptimizedX = lastOptimizedPose.translation().x();
     recentOptimizedY = lastOptimizedPose.translation().y();
 
-    recentIdxUpdated = int(keyframePosesUpdated.size()) - 1;
+    recentIdxUpdated.store(kfUpdatedSize - 1);
 
     mtxRecentPose.unlock();
 } // updatePoses
@@ -636,13 +639,15 @@ void loopFindNearKeyframesCloud( pcl::PointCloud<PointType>::Ptr& nearKeyframes,
     // extract and stacking near keyframes (in global coord)
     nearKeyframes->clear();
     for (int i = -submap_size; i <= submap_size; ++i) {
-        int keyNear = key + i; // see https://github.com/gisbi-kim/SC-A-LOAM/issues/7 ack. @QiMingZhenFan found the error and modified as below. 
-        if (keyNear < 0 || keyNear >= int(keyframeLaserClouds.size()) )
-            continue;
+        int keyNear = key + i; // see https://github.com/gisbi-kim/SC-A-LOAM/issues/7 ack. @QiMingZhenFan found the error and modified as below.
 
-        mKF.lock(); 
+        mKF.lock();
+        if (keyNear < 0 || keyNear >= int(keyframeLaserClouds.size()) ) {
+            mKF.unlock();
+            continue;
+        }
         *nearKeyframes += * local2global(keyframeLaserClouds[keyNear], keyframePosesUpdated[keyNear]);
-        mKF.unlock(); 
+        mKF.unlock();
     }
 
     if (nearKeyframes->empty())
@@ -1011,20 +1016,30 @@ void process_pg()
 // Scan Context 回环检测入口：发现候选回环后把索引对送入 ICP 线程。
 void performSCLoopClosure(void)
 {
-    if( int(keyframePoses.size()) < scManager.NUM_EXCLUDE_RECENT) // do not try too early 
+    // 快照关键帧数量（加锁避免与 process_pg 的 push_back 数据竞争）
+    mKF.lock();
+    int kf_size = (int)keyframePoses.size();
+    mKF.unlock();
+
+    if( kf_size < scManager.NUM_EXCLUDE_RECENT) // do not try too early
         return;
 
-    auto detectResult = scManager.detectLoopClosureID(); // first: nn index, second: yaw diff 
+    auto detectResult = scManager.detectLoopClosureID(); // first: nn index, second: yaw diff
     int SCclosestHistoryFrameID = detectResult.first;
-    if( SCclosestHistoryFrameID != -1 ) { 
+    if( SCclosestHistoryFrameID != -1 ) {
         const int prev_node_idx = SCclosestHistoryFrameID;
-        const int curr_node_idx = keyframePoses.size() - 1; // because cpp starts 0 and ends n-1
-        cout << "Loop detected! - between " << prev_node_idx << " and " << curr_node_idx << "" << endl;
+        const int curr_node_idx = kf_size - 1; // because cpp starts 0 and ends n-1
 
         mBuf.lock();
+        // 去重：已成功处理过的回环对不再重复入队
+        if (processedLoopPairs.count({prev_node_idx, curr_node_idx})) {
+            mBuf.unlock();
+            return;
+        }
         scLoopICPBuf.push(std::pair<int, int>(prev_node_idx, curr_node_idx));
-        // addding actual 6D constraints in the other thread, icp_calculation.
         mBuf.unlock();
+
+        cout << "Loop detected! - between " << prev_node_idx << " and " << curr_node_idx << "" << endl;
     }
 } // performSCLoopClosure
 
@@ -1052,22 +1067,33 @@ void process_icp(void)
                 ROS_WARN("Too many loop clousre candidates to be ICPed is waiting ... Do process_lcd less frequently (adjust loopClosureFrequency)");
             }
 
-            mBuf.lock(); 
+            mBuf.lock();
             std::pair<int, int> loop_idx_pair = scLoopICPBuf.front();
             scLoopICPBuf.pop();
-            mBuf.unlock(); 
+            mBuf.unlock();
 
             const int prev_node_idx = loop_idx_pair.first;
             const int curr_node_idx = loop_idx_pair.second;
+
+            // 二次去重：防止竞态下同一对重复入队
+            mBuf.lock();
+            bool alreadyProcessed = processedLoopPairs.count(loop_idx_pair) > 0;
+            mBuf.unlock();
+            if (alreadyProcessed) continue;
+
             auto relative_pose_optional = doICPVirtualRelative(prev_node_idx, curr_node_idx);
             if(relative_pose_optional) {
                 gtsam::Pose3 relative_pose = relative_pose_optional.value();
                 mtxPosegraph.lock();
                 gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, relative_pose, robustLoopNoise));
                 writeEdge({prev_node_idx, curr_node_idx}, relative_pose, edges_str); // giseop
-                // runISAM2opt();
                 mtxPosegraph.unlock();
-            } 
+
+                // 记录已处理，防止后续重复检测
+                mBuf.lock();
+                processedLoopPairs.insert(loop_idx_pair);
+                mBuf.unlock();
+            }
         }
 
         // wait (must required for running the while loop)
@@ -1083,7 +1109,7 @@ void process_viz_path(void)
     ros::Rate rate(hz);
     while (ros::ok()) {
         rate.sleep();
-        if(recentIdxUpdated > 1) {
+        if(recentIdxUpdated.load() > 1) {
             pubPath();
         }
     }
@@ -1102,9 +1128,11 @@ void process_isam(void)
             cout << "running isam2 optimization ..." << endl;
             mtxPosegraph.unlock();
 
+            mKF.lock();
             saveOptimizedVerticesTUMformat(isamCurrentEstimate, keyframeTimes, pgTUMformat); // pose
             saveOdometryVerticesKITTIformat(odomKITTIformat); // pose
             saveGTSAMgraphG2oFormat(isamCurrentEstimate);
+            mKF.unlock();
         }
     }
 }
@@ -1119,7 +1147,7 @@ void pubMap(void)
 
     mKF.lock(); 
     // for (int node_idx=0; node_idx < int(keyframePosesUpdated.size()); node_idx++) {
-    for (int node_idx=0; node_idx < recentIdxUpdated; node_idx++) {
+    for (int node_idx=0; node_idx < recentIdxUpdated.load(); node_idx++) {
         if(counter % SKIP_FRAMES == 0) {
             *laserCloudMapPGO += *local2global(keyframeLaserClouds[node_idx], keyframePosesUpdated[node_idx]);
         }
@@ -1143,7 +1171,7 @@ void process_viz_map(void)
     ros::Rate rate(vizmapFrequency);
     while (ros::ok()) {
         rate.sleep();
-        if(recentIdxUpdated > 1) {
+        if(recentIdxUpdated.load() > 1) {
             pubMap();
         }
     }
