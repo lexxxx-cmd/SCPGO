@@ -39,6 +39,19 @@
 
 #include <eigen3/Eigen/Dense>
 
+// Workaround for Ceres < 2.1 + Eigen >= 3.4 incompatibility.
+// Eigen 3.4 removed the ScalarBinaryOpTraits class template that older Ceres
+// tries to specialize in jet.h. Provide a minimal primary template so the
+// Ceres partial specializations compile.
+#if EIGEN_VERSION_AT_LEAST(3,4,0)
+namespace Eigen {
+template <typename BinaryOp, typename LhsScalar, typename RhsScalar>
+struct ScalarBinaryOpTraits {
+  enum { Defined = 0 };
+};
+}  // namespace Eigen
+#endif
+
 #include <ceres/ceres.h>
 
 #include <gtsam/inference/Symbol.h>
