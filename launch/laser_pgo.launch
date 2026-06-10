@@ -13,20 +13,52 @@
     <arg name="save_directory" default="$(find SCPGO)/output/" />
 
     <!-- ==================== 关键帧参数 ==================== -->
-    <arg name="keyframe_meter_gap" default="0.2" />
-    <arg name="keyframe_deg_gap"   default="10.0" />
+    <arg name="keyframe_meter_gap" default="2" />
+    <arg name="keyframe_deg_gap"   default="30.0" />
 
     <!-- ==================== Scan Context ==================== -->
-    <arg name="sc_dist_thres" default="0.2" />
-    <arg name="sc_max_radius" default="40.0" />
+    <arg name="sc_dist_thres" default="0.4" />
+    <arg name="sc_max_radius" default="80.0" />
+    <arg name="sc_lidar_height" default="0.3" />
     <!-- 80m 推荐室外，20-40m 推荐室内 -->
 
     <!-- ==================== 功能开关 ==================== -->
     <arg name="use_ground_removal"        default="false" />
     <arg name="use_icp_submap_enhancement" default="false" />
 
+    <!-- ==================== ICP 回环验证 ==================== -->
+    <!-- 室外默认值保持现有行为；室内建议收紧各阈值 -->
+    <arg name="icp_max_correspondence_distance" default="150.0" />
+    <arg name="icp_fitness_score_threshold"     default="0.2" />
+    <arg name="icp_min_source_points"          default="50" />
+    <arg name="icp_min_target_points"          default="50" />
+    <arg name="icp_max_translation"            default="50.0" />
+    <arg name="icp_max_rotation_deg"           default="30.0" />
+
+    <!-- ==================== 回环鲁棒核函数 ==================== -->
+    <!-- kernel_type: cauchy / dcs / geman_mcclure -->
+    <arg name="loop_kernel_type"  default="geman_mcclure" />
+    <arg name="loop_kernel_param" default="1.0" />
+    <arg name="loop_noise_score"  default="0.5" />
+
+    <!-- ==================== 空间近邻回环检测 ==================== -->
+    <!-- 基于欧氏距离绕过 SC 直接 ICP，利用里程计精度发现 SC 可能漏掉的回环 -->
+    <arg name="use_spatial_loop_closure"    default="true" />
+    <arg name="spatial_loop_radius"         default="5.0" />     <!-- 欧氏距离阈值 (m) -->
+    <arg name="spatial_loop_fitness_thres"  default="0.2" />      <!-- 比 SC 回环更严格的 ICP fitness -->
+    <arg name="spatial_loop_min_separation" default="50" />        <!-- 最少间隔关键帧数 -->
+
     <!-- ==================== 可视化 ==================== -->
-    <arg name="mapviz_filter_size" default="0.1" />
+    <arg name="mapviz_filter_size" default="0.4" />
+
+    <!-- ==================== 关键帧保存 ==================== -->
+    <arg name="save_keyframes"            default="true" />
+    <arg name="save_keyframes_directory"  default="$(find SCPGO)/output/" />
+    <arg name="save_keyframes_full_cloud" default="true" />
+
+    <!-- ==================== 输入静默自动退出 ==================== -->
+    <!-- 超过此时间(秒)无新消息则自动保存退出，0 或负数禁用 -->
+    <arg name="input_silence_timeout"     default="50.0" />
 
     <!-- ==================== 输入话题 (可重映射) ==================== -->
     <arg name="cloud_topic"  default="/velodyne_cloud_registered_local" />
@@ -41,6 +73,14 @@
         <!-- 输出路径 -->
         <param name="save_directory" value="$(arg save_directory)" />
 
+        <!-- 关键帧保存 -->
+        <param name="save_keyframes"            value="$(arg save_keyframes)" />
+        <param name="save_keyframes_directory"  value="$(arg save_keyframes_directory)" />
+        <param name="save_keyframes_full_cloud" value="$(arg save_keyframes_full_cloud)" />
+
+        <!-- 输入静默自动退出 -->
+        <param name="input_silence_timeout"     value="$(arg input_silence_timeout)" />
+
         <!-- 关键帧阈值 -->
         <param name="keyframe_meter_gap" value="$(arg keyframe_meter_gap)" />
         <param name="keyframe_deg_gap"   value="$(arg keyframe_deg_gap)" />
@@ -48,10 +88,30 @@
         <!-- Scan Context -->
         <param name="sc_dist_thres" value="$(arg sc_dist_thres)" />
         <param name="sc_max_radius" value="$(arg sc_max_radius)" />
+        <param name="sc_lidar_height" value="$(arg sc_lidar_height)" />
 
         <!-- 功能开关 -->
         <param name="use_ground_removal"        value="$(arg use_ground_removal)" />
         <param name="use_icp_submap_enhancement" value="$(arg use_icp_submap_enhancement)" />
+
+        <!-- ICP 回环验证 -->
+        <param name="icp_max_correspondence_distance" value="$(arg icp_max_correspondence_distance)" />
+        <param name="icp_fitness_score_threshold"     value="$(arg icp_fitness_score_threshold)" />
+        <param name="icp_min_source_points"          value="$(arg icp_min_source_points)" />
+        <param name="icp_min_target_points"          value="$(arg icp_min_target_points)" />
+        <param name="icp_max_translation"            value="$(arg icp_max_translation)" />
+        <param name="icp_max_rotation_deg"           value="$(arg icp_max_rotation_deg)" />
+
+        <!-- 回环鲁棒核函数 -->
+        <param name="loop_kernel_type"  value="$(arg loop_kernel_type)" />
+        <param name="loop_kernel_param" value="$(arg loop_kernel_param)" />
+        <param name="loop_noise_score"  value="$(arg loop_noise_score)" />
+
+        <!-- 空间近邻回环检测 -->
+        <param name="use_spatial_loop_closure"    value="$(arg use_spatial_loop_closure)" />
+        <param name="spatial_loop_radius"         value="$(arg spatial_loop_radius)" />
+        <param name="spatial_loop_fitness_thres"  value="$(arg spatial_loop_fitness_thres)" />
+        <param name="spatial_loop_min_separation" value="$(arg spatial_loop_min_separation)" />
 
         <!-- 地图可视化滤波尺寸 -->
         <param name="mapviz_filter_size" value="$(arg mapviz_filter_size)" />
@@ -66,9 +126,7 @@
     <!-- ============================================================ -->
     <!-- RViz (可选，取消注释以启用)                                     -->
     <!-- ============================================================ -->
-    <!--
     <node pkg="rviz" type="rviz" name="rviz_scpgo"
           args="-d $(find SCPGO)/rviz.rviz" />
-    -->
 
 </launch>
