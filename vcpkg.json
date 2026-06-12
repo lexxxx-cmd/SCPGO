@@ -1,0 +1,17 @@
+{
+  "name": "scpgo",
+  "version": "1.0.0",
+  "description": "Scan Context + Pose Graph Optimization (de-ROSified)",
+  "dependencies": [
+    "eigen3",
+    "pcl",
+    "ceres",
+    "gtsam",
+    "boost-serialization",
+    "boost-thread",
+    "boost-timer",
+    "boost-chrono",
+    "boost-filesystem",
+    "yaml-cpp"
+  ]
+}
