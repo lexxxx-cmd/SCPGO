@@ -1,1 +1,9 @@
 output/
+
+# IDE
+.vs/
+CMakeSettings.json
+
+# Build artifacts
+build/
+out/
