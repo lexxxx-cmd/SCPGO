@@ -9,12 +9,18 @@
 #include <thread>
 #include <iostream>
 #include <string>
+#include <sstream>
 #include <optional>
 #include <iomanip>
 #include <csignal>
+#include <chrono>
+#include <map>
+#include <algorithm>
 
 #include <boost/format.hpp>
 #include <boost/filesystem.hpp>
+
+#include <yaml-cpp/yaml.h>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -30,18 +36,7 @@
 #include <pcl/filters/filter.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/octree/octree_pointcloud_voxelcentroid.h>
-#include <pcl/filters/crop_box.h> 
-#include <pcl_conversions/pcl_conversions.h>
-
-#include <ros/ros.h>
-#include <sensor_msgs/Imu.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <sensor_msgs/NavSatFix.h>
-#include <tf/transform_datatypes.h>
-#include <tf/transform_broadcaster.h>
-#include <nav_msgs/Odometry.h>
-#include <nav_msgs/Path.h>
-#include <geometry_msgs/PoseStamped.h>
+#include <pcl/filters/crop_box.h>
 
 #include <eigen3/Eigen/Dense>
 
@@ -80,9 +75,50 @@ struct ScalarBinaryOpTraits {
 #include "SCPGO/scancontext/Scancontext.h"
 
 // ------------------------------------------------------------
+// 替代 ROS 消息类型的纯 C++ 数据结构
+// ------------------------------------------------------------
+
+// TUM 格式位姿数据（替代 nav_msgs::Odometry）
+struct OdomData {
+    double timestamp;
+    double x, y, z;
+    double qx, qy, qz, qw;  // 四元数
+};
+
+// GPS 数据（替代 sensor_msgs::NavSatFix）
+struct GpsData {
+    double timestamp;
+    double latitude, longitude, altitude;
+};
+
+// 从 YAML 节点读取参数，带默认值回退
+template<typename T>
+T getParamOrDefault(const YAML::Node& node, const std::string& key, const T& default_val)
+{
+    if (!node[key]) return default_val;
+    return node[key].as<T>();
+}
+
+// 辅助：从 "a.b.c" 格式的 key 中逐级查找 YAML 节点
+template<typename T>
+T getParamOrDefaultDeep(const YAML::Node& root, const std::string& dotkey, const T& default_val)
+{
+    YAML::Node cur = root;
+    size_t pos = 0, next;
+    while ((next = dotkey.find('.', pos)) != std::string::npos) {
+        std::string part = dotkey.substr(pos, next - pos);
+        if (!cur[part]) return default_val;
+        cur = cur[part];
+        pos = next + 1;
+    }
+    std::string last = dotkey.substr(pos);
+    if (!cur[last]) return default_val;
+    return cur[last].as<T>();
+}
+
+// ------------------------------------------------------------
 // 优雅退出标志与信号处理
-// 替代 ROS 默认的 SIGINT handler，完全由 main() 控制退出流程：
-// Ctrl+C/SIGTERM 只设置标志，不做 shutdown；等所有保存完成后才调 ros::shutdown()
+// Ctrl+C/SIGTERM 只设置标志，不做强制退出；等所有保存完成后才返回
 // ------------------------------------------------------------
 static std::atomic<bool> g_shutdown_requested{false};
 
@@ -93,7 +129,6 @@ static std::atomic<bool>  g_has_received_input{false}; // 是否已收到过消�
 static void gracefulShutdownHandler(int /*sig*/)
 {
     g_shutdown_requested.store(true);
-    // 不调 ros::shutdown() —— 让 main() 先完成保存
 }
 
 using namespace gtsam;
@@ -143,9 +178,9 @@ double spatialLoopFitnessThres = 0.1;     // 比 SC 回环更严格的 ICP fitne
 int spatialLoopMinSeparation = 50;        // 最少间隔关键帧数（排除近邻自匹配）
 
 // ------------------------- 输入缓存：回调只负责入队 -------------------------
-std::queue<nav_msgs::Odometry::ConstPtr> odometryBuf;
-std::queue<sensor_msgs::PointCloud2ConstPtr> fullResBuf;
-std::queue<sensor_msgs::NavSatFix::ConstPtr> gpsBuf;
+std::queue<OdomData> odometryBuf;
+std::queue<pcl::PointCloud<PointType>::Ptr> fullResBuf;
+std::queue<GpsData> gpsBuf;
 std::queue<std::pair<int, int> > scLoopICPBuf;
 std::set<std::pair<int, int>> processedLoopPairs; // 已处理的回环对，防止重复添加
 
@@ -208,19 +243,14 @@ bool laserCloudMapPGORedraw = true;
 
 bool useGPS = true;
 // bool useGPS = false;
-sensor_msgs::NavSatFix::ConstPtr currGPS;
+GpsData currGPS;
 bool hasGPSforThisKF = false;
 bool gpsOffsetInitialized = false; 
 double gpsAltitudeInitOffset = 0.0;
 double recentOptimizedX = 0.0;
 double recentOptimizedY = 0.0;
 
-// ------------------------- ROS 发布器与导出文件 -------------------------
-ros::Publisher pubMapAftPGO, pubOdomAftPGO, pubPathAftPGO;
-ros::Publisher pubLoopScanLocal, pubLoopSubmapLocal;
-ros::Publisher pubLoopScanIcp, pubLoopSubmapIcp;
-ros::Publisher pubWindowSubmapSC, pubWindowSubmapNoGround;
-ros::Publisher pubOdomRepubVerifier;
+// ------------------------- 导出文件 -------------------------
 
 std::string save_directory;
 std::string pgTUMformat;
@@ -362,34 +392,57 @@ void saveOptimizedVerticesTUMformat(gtsam::Values _estimates, const std::vector<
     }
 }
 
-// 里程计回调只做缓存，不在回调线程里做耗时计算。
-void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr &_laserOdometry)
+// 读取 TUM 格式位姿文件：timestamp tx ty tz qx qy qz qw
+// 返回 map：PCD 文件名 stem → OdomData
+std::map<std::string, OdomData> loadTumPoses(const std::string& path)
 {
-    g_has_received_input.store(true);
-    g_last_input_time.store(ros::WallTime::now().toSec());
-
-	mBuf.lock();
-	odometryBuf.push(_laserOdometry);
-	mBuf.unlock();
-} // laserOdometryHandler
-
-void laserCloudFullResHandler(const sensor_msgs::PointCloud2ConstPtr &_laserCloudFullRes)
-// 点云回调同样只入队，真正的处理放到工作线程里。
-{
-	mBuf.lock();
-	fullResBuf.push(_laserCloudFullRes);
-	mBuf.unlock();
-} // laserCloudFullResHandler
-
-void gpsHandler(const sensor_msgs::NavSatFix::ConstPtr &_gps)
-// GPS 回调：只有启用 GPS 时才缓存到队列。
-{
-    if(useGPS) {
-        mBuf.lock();
-        gpsBuf.push(_gps);
-        mBuf.unlock();
+    std::map<std::string, OdomData> result;
+    std::ifstream ifs(path);
+    if (!ifs) {
+        std::cerr << "[ERROR] Cannot open TUM poses file: " << path << std::endl;
+        return result;
     }
-} // gpsHandler
+    std::string line;
+    while (std::getline(ifs, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream iss(line);
+        OdomData odom;
+        if (iss >> odom.timestamp >> odom.x >> odom.y >> odom.z
+                >> odom.qx >> odom.qy >> odom.qz >> odom.qw) {
+            // 用时间戳字符串作为 key（与 PCD 文件名匹配）
+            std::ostringstream key;
+            key << std::fixed << std::setprecision(6) << odom.timestamp;
+            result[key.str()] = odom;
+        }
+    }
+    std::cout << "[INFO] Loaded " << result.size() << " TUM poses from " << path << std::endl;
+    return result;
+}
+
+// 扫描 PCD 目录，匹配位姿，构建 FrameData deque（按文件名中的时间戳排序）
+std::deque<std::pair<double, std::string>> scanPcdDirectory(const std::string& pcdDir)
+{
+    std::deque<std::pair<double, std::string>> result;  // (timestamp, pcd_path)
+    boost::filesystem::path dir(pcdDir);
+    if (!boost::filesystem::exists(dir) || !boost::filesystem::is_directory(dir)) {
+        std::cerr << "[ERROR] PCD directory not found: " << pcdDir << std::endl;
+        return result;
+    }
+    for (const auto& entry : boost::filesystem::directory_iterator(dir)) {
+        if (entry.path().extension() == ".pcd") {
+            std::string stem = entry.path().stem().string();
+            // 尝试将 stem 解析为 double timestamp
+            double ts = 0.0;
+            try { ts = std::stod(stem); }
+            catch (...) { /* 非数字文件名，放在最后 */ }
+            result.push_back({ts, entry.path().string()});
+        }
+    }
+    std::sort(result.begin(), result.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::cout << "[INFO] Found " << result.size() << " PCD files in " << pcdDir << std::endl;
+    return result;
+}
 
 void initNoises( void )
 // 初始化位姿图的噪声模型：先验、里程计、回环和 GPS 四类。
@@ -432,18 +485,26 @@ void initNoises( void )
                     gtsam::noiseModel::Diagonal::Variances(robustNoiseVector3) );
 
 } // initNoises
-// 从里程计消息里提取平移和 RPY 姿态。
-Pose6D getOdom(nav_msgs::Odometry::ConstPtr _odom)
+// 从里程计数据构造 Pose6D。
+Pose6D getOdom(const OdomData& _odom)
 {
-    auto tx = _odom->pose.pose.position.x;
-    auto ty = _odom->pose.pose.position.y;
-    auto tz = _odom->pose.pose.position.z;
+    // 四元数 → RPY
+    double sinr_cosp = 2.0 * (_odom.qw * _odom.qx + _odom.qy * _odom.qz);
+    double cosr_cosp = 1.0 - 2.0 * (_odom.qx * _odom.qx + _odom.qy * _odom.qy);
+    double roll = std::atan2(sinr_cosp, cosr_cosp);
 
-    double roll, pitch, yaw;
-    geometry_msgs::Quaternion quat = _odom->pose.pose.orientation;
-    tf::Matrix3x3(tf::Quaternion(quat.x, quat.y, quat.z, quat.w)).getRPY(roll, pitch, yaw);
+    double sinp = 2.0 * (_odom.qw * _odom.qy - _odom.qz * _odom.qx);
+    double pitch;
+    if (std::abs(sinp) >= 1.0)
+        pitch = std::copysign(M_PI / 2.0, sinp);
+    else
+        pitch = std::asin(sinp);
 
-    return Pose6D{tx, ty, tz, roll, pitch, yaw}; 
+    double siny_cosp = 2.0 * (_odom.qw * _odom.qz + _odom.qx * _odom.qy);
+    double cosy_cosp = 1.0 - 2.0 * (_odom.qy * _odom.qy + _odom.qz * _odom.qz);
+    double yaw = std::atan2(siny_cosp, cosy_cosp);
+
+    return Pose6D{_odom.x, _odom.y, _odom.z, roll, pitch, yaw};
 } // getOdom
 
 // 计算两个位姿之间的变化量，用于关键帧判定。
@@ -561,7 +622,9 @@ pcl::PointCloud<PointType>::Ptr local2global(const pcl::PointCloud<PointType>::P
         cloudOut->points[i].x = transCur(0,0) * pointFrom.x + transCur(0,1) * pointFrom.y + transCur(0,2) * pointFrom.z + transCur(0,3);
         cloudOut->points[i].y = transCur(1,0) * pointFrom.x + transCur(1,1) * pointFrom.y + transCur(1,2) * pointFrom.z + transCur(1,3);
         cloudOut->points[i].z = transCur(2,0) * pointFrom.x + transCur(2,1) * pointFrom.y + transCur(2,2) * pointFrom.z + transCur(2,3);
-        cloudOut->points[i].intensity = pointFrom.intensity;
+        cloudOut->points[i].r = pointFrom.r;
+        cloudOut->points[i].g = pointFrom.g;
+        cloudOut->points[i].b = pointFrom.b;
     }
 
     return cloudOut;
@@ -595,59 +658,16 @@ pcl::PointCloud<PointType>::Ptr local2center(
         cloudOut->points[i].x = T_center_inv(0,0) * pointFrom.x + T_center_inv(0,1) * pointFrom.y + T_center_inv(0,2) * pointFrom.z + T_center_inv(0,3);
         cloudOut->points[i].y = T_center_inv(1,0) * pointFrom.x + T_center_inv(1,1) * pointFrom.y + T_center_inv(1,2) * pointFrom.z + T_center_inv(1,3);
         cloudOut->points[i].z = T_center_inv(2,0) * pointFrom.x + T_center_inv(2,1) * pointFrom.y + T_center_inv(2,2) * pointFrom.z + T_center_inv(2,3);
-        cloudOut->points[i].intensity = pointFrom.intensity;
+        cloudOut->points[i].r = pointFrom.r;
+        cloudOut->points[i].g = pointFrom.g;
+        cloudOut->points[i].b = pointFrom.b;
     }
 
     return cloudOut;
 }
 
-// 发布优化后的最后一帧位姿和整条路径，同时广播 TF。
-void pubPath( void )
-{
-    // pub odom and path 
-    nav_msgs::Odometry odomAftPGO;
-    nav_msgs::Path pathAftPGO;
-    pathAftPGO.header.frame_id = "camera_init";
-    mKF.lock(); 
-    // for (int node_idx=0; node_idx < int(keyframePosesUpdated.size()) - 1; node_idx++) // -1 is just delayed visualization (because sometimes mutexed while adding(push_back) a new one)
-    for (int node_idx=0; node_idx < recentIdxUpdated.load(); node_idx++) // -1 is just delayed visualization (because sometimes mutexed while adding(push_back) a new one)
-    {
-        const Pose6D& pose_est = keyframePosesUpdated.at(node_idx); // upodated poses
-        // const gtsam::Pose3& pose_est = isamCurrentEstimate.at<gtsam::Pose3>(node_idx);
-
-        nav_msgs::Odometry odomAftPGOthis;
-        odomAftPGOthis.header.frame_id = "camera_init";
-        odomAftPGOthis.child_frame_id = "aft_pgo";
-        odomAftPGOthis.header.stamp = ros::Time().fromSec(keyframeTimes.at(node_idx));
-        odomAftPGOthis.pose.pose.position.x = pose_est.x;
-        odomAftPGOthis.pose.pose.position.y = pose_est.y;
-        odomAftPGOthis.pose.pose.position.z = pose_est.z;
-        odomAftPGOthis.pose.pose.orientation = tf::createQuaternionMsgFromRollPitchYaw(pose_est.roll, pose_est.pitch, pose_est.yaw);
-        odomAftPGO = odomAftPGOthis;
-
-        geometry_msgs::PoseStamped poseStampAftPGO;
-        poseStampAftPGO.header = odomAftPGOthis.header;
-        poseStampAftPGO.pose = odomAftPGOthis.pose.pose;
-
-        pathAftPGO.header.stamp = odomAftPGOthis.header.stamp;
-        pathAftPGO.header.frame_id = "camera_init";
-        pathAftPGO.poses.push_back(poseStampAftPGO);
-    }
-    mKF.unlock(); 
-    pubOdomAftPGO.publish(odomAftPGO); // last pose 
-    pubPathAftPGO.publish(pathAftPGO); // poses 
-
-    static tf::TransformBroadcaster br;
-    tf::Transform transform;
-    tf::Quaternion q;
-    transform.setOrigin(tf::Vector3(odomAftPGO.pose.pose.position.x, odomAftPGO.pose.pose.position.y, odomAftPGO.pose.pose.position.z));
-    q.setW(odomAftPGO.pose.pose.orientation.w);
-    q.setX(odomAftPGO.pose.pose.orientation.x);
-    q.setY(odomAftPGO.pose.pose.orientation.y);
-    q.setZ(odomAftPGO.pose.pose.orientation.z);
-    transform.setRotation(q);
-    br.sendTransform(tf::StampedTransform(transform, ros::Time::now(), "camera_init", "aft_pgo"));
-} // pubPath
+// pubPath 已移除 —— 去 ROS 化后不再需要 ROS TF 广播和路径可视化发布。
+// 优化后的轨迹通过文件导出（TUM / KITTI / g2o 格式），无需 ROS publisher。
 
 // 用 iSAM2 的最新估计回填关键帧位姿，并更新最近优化位姿缓存。
 void updatePoses(void)
@@ -712,7 +732,9 @@ pcl::PointCloud<PointType>::Ptr transformPointCloud(pcl::PointCloud<PointType>::
         cloudOut->points[i].x = transCur(0,0) * pointFrom->x + transCur(0,1) * pointFrom->y + transCur(0,2) * pointFrom->z + transCur(0,3);
         cloudOut->points[i].y = transCur(1,0) * pointFrom->x + transCur(1,1) * pointFrom->y + transCur(1,2) * pointFrom->z + transCur(1,3);
         cloudOut->points[i].z = transCur(2,0) * pointFrom->x + transCur(2,1) * pointFrom->y + transCur(2,2) * pointFrom->z + transCur(2,3);
-        cloudOut->points[i].intensity = pointFrom->intensity;
+        cloudOut->points[i].r = pointFrom->r;
+        cloudOut->points[i].g = pointFrom->g;
+        cloudOut->points[i].b = pointFrom->b;
     }
     return cloudOut;
 } // transformPointCloud
@@ -821,17 +843,6 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
         loopFindNearKeyframesCloud(targetKeyframeCloud, _loop_kf_idx, historyKeyframeSearchNum, _loop_kf_idx);
     }
 
-    // loop verification
-    sensor_msgs::PointCloud2 cureKeyframeCloudMsg;
-    pcl::toROSMsg(*cureKeyframeCloud, cureKeyframeCloudMsg);
-    cureKeyframeCloudMsg.header.frame_id = "camera_init";
-    pubLoopScanLocal.publish(cureKeyframeCloudMsg);
-
-    sensor_msgs::PointCloud2 targetKeyframeCloudMsg;
-    pcl::toROSMsg(*targetKeyframeCloud, targetKeyframeCloudMsg);
-    targetKeyframeCloudMsg.header.frame_id = "camera_init";
-    pubLoopSubmapLocal.publish(targetKeyframeCloudMsg);
-
     // ---- 点数预检：source 和 target 必须有足够的点 ----
     int sourcePts = (int)cureKeyframeCloud->size();
     int targetPts = (int)targetKeyframeCloud->size();
@@ -922,17 +933,6 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
              << ", consistency_trans=" << consistencyTrans << "m"
              << ", consistency_rot=" << rad2deg(consistencyRot) << "°" << endl;
 
-        // 发布经过 ICP 验证的成功匹配回环关键帧
-        sensor_msgs::PointCloud2 loopScanIcpMsg;
-        pcl::toROSMsg(*unused_result, loopScanIcpMsg);
-        loopScanIcpMsg.header.frame_id = "camera_init";
-        pubLoopScanIcp.publish(loopScanIcpMsg);
-
-        sensor_msgs::PointCloud2 loopSubmapIcpMsg;
-        pcl::toROSMsg(*targetKeyframeCloud, loopSubmapIcpMsg);
-        loopSubmapIcpMsg.header.frame_id = "camera_init";
-        pubLoopSubmapIcp.publish(loopSubmapIcpMsg);
-
         return icpRelative;
     }
 } // doICPVirtualRelative
@@ -947,37 +947,33 @@ void process_pg()
             //
             // pop and check keyframe is or not  
             // 
-			mBuf.lock();       
-            while (!odometryBuf.empty() && odometryBuf.front()->header.stamp.toSec() < fullResBuf.front()->header.stamp.toSec())
-                odometryBuf.pop();
+			mBuf.lock();
+            // 数据已按时间排序加载，直接 pop 即可（无需时间戳对齐判断）
             if (odometryBuf.empty())
             {
                 mBuf.unlock();
                 break;
             }
 
-            // 这里要求里程计和点云时间尽量对齐；先丢掉更早的里程计帧，避免错配。
-            timeLaserOdometry = odometryBuf.front()->header.stamp.toSec();
-            timeLaser = fullResBuf.front()->header.stamp.toSec();
+            timeLaserOdometry = odometryBuf.front().timestamp;
+            timeLaser = timeLaserOdometry;
             // TODO
 
             laserCloudFullRes->clear();
-            pcl::PointCloud<PointType>::Ptr thisKeyFrame(new pcl::PointCloud<PointType>());
-            pcl::fromROSMsg(*fullResBuf.front(), *thisKeyFrame);
+            pcl::PointCloud<PointType>::Ptr thisKeyFrame = fullResBuf.front();
             fullResBuf.pop();
 
             Pose6D pose_curr = getOdom(odometryBuf.front());
             odometryBuf.pop();
 
-            // find nearest gps 
-            double eps = 0.1; // find a gps topioc arrived within eps second 
+            // find nearest gps
+            double eps = 0.1; // find a gps topioc arrived within eps second
             while (!gpsBuf.empty()) {
                 auto thisGPS = gpsBuf.front();
-                auto thisGPSTime = thisGPS->header.stamp.toSec();
+                double thisGPSTime = thisGPS.timestamp;
                 if( abs(thisGPSTime - timeLaserOdometry) < eps ) {
-                    // 找到与当前关键帧时间最接近的 GPS 数据，就把它绑定到这一帧。
                     currGPS = thisGPS;
-                    hasGPSforThisKF = true; 
+                    hasGPSforThisKF = true;
                     break;
                 } else {
                     hasGPSforThisKF = false;
@@ -1014,10 +1010,10 @@ void process_pg()
                 continue;
 
             if( !gpsOffsetInitialized ) {
-                if(hasGPSforThisKF) { // if the very first frame 
-                    gpsAltitudeInitOffset = currGPS->altitude;
+                if(hasGPSforThisKF) { // if the very first frame
+                    gpsAltitudeInitOffset = currGPS.altitude;
                     gpsOffsetInitialized = true;
-                } 
+                }
             }
 
             //
@@ -1066,28 +1062,10 @@ void process_pg()
             }
 
             if (useGroundRemoval) {
-                // 3) 发布原始合并子地图（去地面前，用于对比查看）
-                {
-                    sensor_msgs::PointCloud2 rawMsg;
-                    pcl::toROSMsg(*windowSubmap, rawMsg);
-                    rawMsg.header.frame_id = "camera_init";
-                    rawMsg.header.stamp = ros::Time().fromSec(timeLaserOdometry);
-                    pubWindowSubmapSC.publish(rawMsg);
-                }
-
-                // 4) RANSAC 去地面
+                // 1) RANSAC 去地面
                 pcl::PointCloud<PointType>::Ptr windowSubmapNoGround = removeGroundRANSAC(windowSubmap);
 
-                // 5) 发布去地面后子地图（用于 RViz 检查效果）
-                {
-                    sensor_msgs::PointCloud2 noGroundMsg;
-                    pcl::toROSMsg(*windowSubmapNoGround, noGroundMsg);
-                    noGroundMsg.header.frame_id = "camera_init";
-                    noGroundMsg.header.stamp = ros::Time().fromSec(timeLaserOdometry);
-                    pubWindowSubmapNoGround.publish(noGroundMsg);
-                }
-
-                // 6) 对去地面后子地图降采样，控制点数
+                // 2) 对去地面后子地图降采样，控制点数
                 downSizeFilterScancontext.setInputCloud(windowSubmapNoGround);
                 downSizeFilterScancontext.filter(*windowSubmapDS);
 
@@ -1133,7 +1111,7 @@ void process_pg()
 
                     // 如果当前关键帧附近有 GPS，就额外加入高度约束。
                     if(hasGPSforThisKF) {
-                        double curr_altitude_offseted = currGPS->altitude - gpsAltitudeInitOffset;
+                        double curr_altitude_offseted = currGPS.altitude - gpsAltitudeInitOffset;
                         mtxRecentPose.lock();
                         gtsam::Point3 gpsConstraint(recentOptimizedX, recentOptimizedY, curr_altitude_offseted); // in this example, only adjusting altitude (for x and y, very big noises are set) 
                         mtxRecentPose.unlock();
@@ -1270,13 +1248,13 @@ void performSpatialLoopClosure(void)
 void process_lcd(void)
 {
     float loopClosureFrequency = 1.0; // can change
-    ros::WallDuration cycleTime(1.0 / loopClosureFrequency);
+    auto cycleTime = std::chrono::duration<double>(1.0 / loopClosureFrequency);
     while (!g_shutdown_requested.load())
     {
         // 响应式 sleep：拆成 100ms 片段，每片段检查退出标志
-        ros::WallTime deadline = ros::WallTime::now() + cycleTime;
-        while (!g_shutdown_requested.load() && ros::WallTime::now() < deadline) {
-            ros::WallDuration(0.1).sleep();
+        auto deadline = std::chrono::steady_clock::now() + cycleTime;
+        while (!g_shutdown_requested.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         if (g_shutdown_requested.load()) break;
         performSCLoopClosure();
@@ -1292,7 +1270,7 @@ void process_icp(void)
 		while ( !g_shutdown_requested.load() && !scLoopICPBuf.empty() )
         {
             if( scLoopICPBuf.size() > 30 ) {
-                ROS_WARN("Too many loop clousre candidates to be ICPed is waiting ... Do process_lcd less frequently (adjust loopClosureFrequency)");
+                std::cout << "[WARN] Too many loop closure candidates to be ICPed is waiting ... Do process_lcd less frequently (adjust loopClosureFrequency)" << std::endl;
             }
 
             mBuf.lock();
@@ -1330,34 +1308,16 @@ void process_icp(void)
     }
 } // process_icp
 
-// 轨迹可视化线程：高频发布优化后的路径。
-void process_viz_path(void)
-{
-    float hz = 10.0;
-    ros::WallDuration cycleTime(1.0 / hz);
-    while (!g_shutdown_requested.load()) {
-        // 响应式 sleep：拆成 100ms 片段
-        ros::WallTime deadline = ros::WallTime::now() + cycleTime;
-        while (!g_shutdown_requested.load() && ros::WallTime::now() < deadline) {
-            ros::WallDuration(0.1).sleep();
-        }
-        if (g_shutdown_requested.load()) break;
-        if(recentIdxUpdated.load() > 1) {
-            pubPath();
-        }
-    }
-}
-
 // 定时运行 iSAM2，并把最新优化结果导出到磁盘。
 void process_isam(void)
 {
     float hz = 1;
-    ros::WallDuration cycleTime(1.0 / hz);
+    auto cycleTime = std::chrono::duration<double>(1.0 / hz);
     while (!g_shutdown_requested.load()) {
         // 响应式 sleep：拆成 100ms 片段
-        ros::WallTime deadline = ros::WallTime::now() + cycleTime;
-        while (!g_shutdown_requested.load() && ros::WallTime::now() < deadline) {
-            ros::WallDuration(0.1).sleep();
+        auto deadline = std::chrono::steady_clock::now() + cycleTime;
+        while (!g_shutdown_requested.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         if (g_shutdown_requested.load()) break;
         if( gtSAMgraphMade ) {
@@ -1375,50 +1335,8 @@ void process_isam(void)
     }
 }
 
-// 把已优化的关键帧点云拼成稀疏全局地图并发布。
-void pubMap(void)
-{
-    int SKIP_FRAMES = 2; // sparse map visulalization to save computations 
-    int counter = 0;
-
-    laserCloudMapPGO->clear();
-
-    mKF.lock(); 
-    // for (int node_idx=0; node_idx < int(keyframePosesUpdated.size()); node_idx++) {
-    for (int node_idx=0; node_idx < recentIdxUpdated.load(); node_idx++) {
-        if(counter % SKIP_FRAMES == 0) {
-            *laserCloudMapPGO += *local2global(keyframeLaserClouds[node_idx], keyframePosesUpdated[node_idx]);
-        }
-        counter++;
-    }
-    mKF.unlock(); 
-
-    downSizeFilterMapPGO.setInputCloud(laserCloudMapPGO);
-    downSizeFilterMapPGO.filter(*laserCloudMapPGO);
-
-    sensor_msgs::PointCloud2 laserCloudMapPGOMsg;
-    pcl::toROSMsg(*laserCloudMapPGO, laserCloudMapPGOMsg);
-    laserCloudMapPGOMsg.header.frame_id = "camera_init";
-    pubMapAftPGO.publish(laserCloudMapPGOMsg);
-}
-
-// 地图可视化线程：低频发布全局地图，减少计算开销。
-void process_viz_map(void)
-{
-    float vizmapFrequency = 0.1; // 0.1 means run onces every 10s
-    ros::WallDuration cycleTime(1.0 / vizmapFrequency);
-    while (!g_shutdown_requested.load()) {
-        // 响应式 sleep：拆成 100ms 片段
-        ros::WallTime deadline = ros::WallTime::now() + cycleTime;
-        while (!g_shutdown_requested.load() && ros::WallTime::now() < deadline) {
-            ros::WallDuration(0.1).sleep();
-        }
-        if (g_shutdown_requested.load()) break;
-        if(recentIdxUpdated.load() > 1) {
-            pubMap();
-        }
-    }
-} // pointcloud_viz
+// pubMap 和 process_viz_map 已移除 —— 去 ROS 化后不再需要 ROS 地图可视化发布。
+// 最终地图通过 saveGlobalMap() 直接保存为 PCD 文件。
 
 // 将所有关键帧点云按最终优化位姿拼接、滤波后保存成 PCD 全局地图。
 void saveGlobalMap(const std::string& _filename)
@@ -1557,65 +1475,67 @@ void recoverAllPosesTUM(const std::string& _filename)
 } // recoverAllPosesTUM
 
 
-// 程序入口：初始化 ROS、参数、线程，然后在退出时统一保存结果。
+// 程序入口：加载 YAML 配置 → 读入数据 → 启动处理线程 → 等待完成 → 保存结果。
 int main(int argc, char **argv)
 {
-    // 阻止 ROS 安装默认 SIGINT handler，由我们自己管理退出流程
-	ros::init(argc, argv, "laserPGO", ros::init_options::NoSigintHandler);
-	signal(SIGINT,  gracefulShutdownHandler);
-	signal(SIGTERM, gracefulShutdownHandler);
+    signal(SIGINT,  gracefulShutdownHandler);
+    signal(SIGTERM, gracefulShutdownHandler);
 
-	ros::NodeHandle nh;
-	ros::NodeHandle pnh("~");
+    // -------------------- 1. 加载 YAML 配置 --------------------
+    std::string configPath = (argc >= 2) ? argv[1] : "config/default.yaml";
+    std::cout << "[INFO] Loading config: " << configPath << std::endl;
+    YAML::Node cfg = YAML::LoadFile(configPath);
 
+    // 输出路径
+    save_directory              = getParamOrDefaultDeep<std::string>(cfg, "output.save_directory", "output/");
+    saveKeyframesEnabled        = getParamOrDefaultDeep<bool>(cfg, "output.save_keyframes", false);
+    saveKeyframesDirectory      = getParamOrDefaultDeep<std::string>(cfg, "output.save_keyframes_directory", "");
+    saveKeyframesFullCloud      = getParamOrDefaultDeep<bool>(cfg, "output.save_keyframes_full_cloud", true);
 
-    // ------------------------- 输出文件路径 -------------------------
-	pnh.param<std::string>("save_directory", save_directory, ""); // launch 文件传入，默认空串避免误写
-	pnh.param<bool>("save_keyframes", saveKeyframesEnabled, false);
-	pnh.param<std::string>("save_keyframes_directory", saveKeyframesDirectory, "");
-	pnh.param<bool>("save_keyframes_full_cloud", saveKeyframesFullCloud, true);
+    // 确保输出目录以 / 结尾
+    if (!save_directory.empty() && save_directory.back() != '/') save_directory += '/';
 
     pgTUMformat = save_directory + "optimized_poses.txt";
     odomKITTIformat = save_directory + "odom_poses.txt";
 
-    // pgG2oSaveStream = std::fstream(save_directory + "singlesession_posegraph.g2o", std::fstream::out);
-
     pgTimeSaveStream = std::fstream(save_directory + "times.txt", std::fstream::out);
     pgTimeSaveStream.precision(std::numeric_limits<double>::max_digits10);
 
+    // 算法参数
+    keyframeMeterGap  = getParamOrDefaultDeep<double>(cfg, "keyframe.meter_gap", 2.0);
+    keyframeDegGap    = getParamOrDefaultDeep<double>(cfg, "keyframe.deg_gap", 10.0);
+    keyframeRadGap    = deg2rad(keyframeDegGap);
 
-    // ------------------------- 算法参数：关键帧、回环、地图滤波 -------------------------
-	pnh.param<double>("keyframe_meter_gap", keyframeMeterGap, 2.0); // pose assignment every k m move
-	pnh.param<double>("keyframe_deg_gap", keyframeDegGap, 10.0); // pose assignment every k deg rot
-    keyframeRadGap = deg2rad(keyframeDegGap);
+    scDistThres       = getParamOrDefaultDeep<double>(cfg, "scan_context.dist_thres", 0.2);
+    scMaximumRadius   = getParamOrDefaultDeep<double>(cfg, "scan_context.max_radius", 80.0);
+    scManager.LIDAR_HEIGHT = getParamOrDefaultDeep<double>(cfg, "scan_context.lidar_height", 2.0);
 
-	pnh.param<double>("sc_dist_thres", scDistThres, 0.2);
-	pnh.param<double>("sc_max_radius", scMaximumRadius, 80.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor
-	pnh.param<double>("sc_lidar_height", scManager.LIDAR_HEIGHT, 2.0);
-	pnh.param<bool>("use_ground_removal", useGroundRemoval, true);             // 是否启用 RANSAC 去地面
-	pnh.param<bool>("use_icp_submap_enhancement", useICPSubmapEnhancement, true); // 是否启用 ICP 子地图增强
+    useGroundRemoval        = getParamOrDefault<bool>(cfg, "use_ground_removal", true);
+    useICPSubmapEnhancement = getParamOrDefault<bool>(cfg, "use_icp_submap_enhancement", true);
 
-	// ICP 回环验证参数
-	pnh.param<double>("icp_max_correspondence_distance", icpMaxCorrespondenceDistance, 150.0);
-	pnh.param<double>("icp_fitness_score_threshold", icpFitnessScoreThreshold, 0.3);
-	pnh.param<int>("icp_min_source_points", icpMinSourcePoints, 50);
-	pnh.param<int>("icp_min_target_points", icpMinTargetPoints, 50);
-	pnh.param<double>("icp_max_translation", icpMaxTranslation, 50.0);
-	double icpMaxRotationDeg;
-	pnh.param<double>("icp_max_rotation_deg", icpMaxRotationDeg, 30.0);
-	icpMaxRotationRad = deg2rad(icpMaxRotationDeg);
+    icpMaxCorrespondenceDistance = getParamOrDefaultDeep<double>(cfg, "icp.max_correspondence_distance", 150.0);
+    icpFitnessScoreThreshold     = getParamOrDefaultDeep<double>(cfg, "icp.fitness_score_threshold", 0.3);
+    icpMinSourcePoints           = getParamOrDefaultDeep<int>(cfg, "icp.min_source_points", 50);
+    icpMinTargetPoints           = getParamOrDefaultDeep<int>(cfg, "icp.min_target_points", 50);
+    icpMaxTranslation            = getParamOrDefaultDeep<double>(cfg, "icp.max_translation", 50.0);
+    double icpMaxRotationDeg     = getParamOrDefaultDeep<double>(cfg, "icp.max_rotation_deg", 30.0);
+    icpMaxRotationRad            = deg2rad(icpMaxRotationDeg);
 
-	// 回环鲁棒核函数参数
-	pnh.param<double>("loop_noise_score", loopNoiseScore, 0.5);
-	pnh.param<double>("loop_kernel_param", loopKernelParam, 1.0);
-	pnh.param<std::string>("loop_kernel_type", loopKernelType, std::string("geman_mcclure"));
+    loopNoiseScore  = getParamOrDefaultDeep<double>(cfg, "loop.noise_score", 0.5);
+    loopKernelParam = getParamOrDefaultDeep<double>(cfg, "loop.kernel_param", 1.0);
+    loopKernelType  = getParamOrDefaultDeep<std::string>(cfg, "loop.kernel_type", std::string("geman_mcclure"));
 
-	// 空间近邻回环检测参数
-	pnh.param<bool>("use_spatial_loop_closure", useSpatialLoopClosure, true);
-	pnh.param<double>("spatial_loop_radius", spatialLoopRadius, 10.0);
-	pnh.param<double>("spatial_loop_fitness_thres", spatialLoopFitnessThres, 0.1);
-	pnh.param<int>("spatial_loop_min_separation", spatialLoopMinSeparation, 50);
+    useSpatialLoopClosure    = getParamOrDefaultDeep<bool>(cfg, "spatial_loop.enabled", true);
+    spatialLoopRadius        = getParamOrDefaultDeep<double>(cfg, "spatial_loop.radius", 10.0);
+    spatialLoopFitnessThres  = getParamOrDefaultDeep<double>(cfg, "spatial_loop.fitness_thres", 0.1);
+    spatialLoopMinSeparation = getParamOrDefaultDeep<int>(cfg, "spatial_loop.min_separation", 50);
 
+    double mapVizFilterSize  = getParamOrDefault<double>(cfg, "mapviz_filter_size", 0.4);
+    double inputSilenceTimeout = getParamOrDefault<double>(cfg, "input_silence_timeout", 8.0);
+
+    useGPS = getParamOrDefaultDeep<bool>(cfg, "input.use_gps", false);
+
+    // 初始化优化器和噪声
     ISAM2Params parameters;
     parameters.relinearizeThreshold = 0.01;
     parameters.relinearizeSkip = 1;
@@ -1625,100 +1545,129 @@ int main(int argc, char **argv)
     scManager.setSCdistThres(scDistThres);
     scManager.setMaximumRadius(scMaximumRadius);
 
-
-	// 关键帧点云、ICP 子地图分别使用不同下采样尺度。
-    // 滑动窗口/空间近邻合并后点云范围大幅增加，leaf 过小会导致 VoxelGrid 整数索引溢出
-    float sc_filter_size = 0.05;   // SC 描述子：5cm，7 帧滑动窗口
-    float icp_filter_size = 0.1;   // ICP 子地图：10cm，时间窗口 + 空间近邻可能跨越 50m+
+    // 下采样滤波器
+    float sc_filter_size = 0.05;
+    float icp_filter_size = 0.1;
     downSizeFilterScancontext.setLeafSize(sc_filter_size, sc_filter_size, sc_filter_size);
     downSizeFilterICP.setLeafSize(icp_filter_size, icp_filter_size, icp_filter_size);
-
-    double mapVizFilterSize;
-	pnh.param<double>("mapviz_filter_size", mapVizFilterSize, 0.4); // pose assignment every k frames
     downSizeFilterMapPGO.setLeafSize(mapVizFilterSize, mapVizFilterSize, mapVizFilterSize);
 
+    // -------------------- 2. 读取输入数据到 deque --------------------
+    std::string pcdDir   = getParamOrDefaultDeep<std::string>(cfg, "input.pcd_dir", "all_pcd_body/");
+    std::string tumPath  = getParamOrDefaultDeep<std::string>(cfg, "input.tum_poses", "all_pcd_body/lidar_poses.txt");
+    std::string gpsPath  = getParamOrDefaultDeep<std::string>(cfg, "input.gps_file", "");
 
-    // ------------------------- 订阅输入话题 -------------------------
-    ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_registered_local", 100, laserCloudFullResHandler);
-	ros::Subscriber subLaserOdometry = nh.subscribe<nav_msgs::Odometry>("/aft_mapped_to_init", 100, laserOdometryHandler);
-	ros::Subscriber subGPS = nh.subscribe<sensor_msgs::NavSatFix>("/gps/fix", 100, gpsHandler);
+    auto pcdFiles = scanPcdDirectory(pcdDir);
+    if (pcdFiles.empty()) {
+        std::cerr << "[ERROR] No PCD files found in " << pcdDir << std::endl;
+        return 1;
+    }
 
-    // ------------------------- 发布输出话题 -------------------------
-	pubOdomAftPGO = nh.advertise<nav_msgs::Odometry>("/aft_pgo_odom", 100);
-	pubOdomRepubVerifier = nh.advertise<nav_msgs::Odometry>("/repub_odom", 100);
-	pubPathAftPGO = nh.advertise<nav_msgs::Path>("/aft_pgo_path", 100);
-	pubMapAftPGO = nh.advertise<sensor_msgs::PointCloud2>("/aft_pgo_map", 100);
+    auto tumPoses = loadTumPoses(tumPath);
 
-	pubLoopScanLocal = nh.advertise<sensor_msgs::PointCloud2>("/loop_scan_local", 100);
-	pubLoopSubmapLocal = nh.advertise<sensor_msgs::PointCloud2>("/loop_submap_local", 100);
-	pubLoopScanIcp = nh.advertise<sensor_msgs::PointCloud2>("/loop_scan_icp", 100);
-	pubLoopSubmapIcp = nh.advertise<sensor_msgs::PointCloud2>("/loop_submap_icp", 100);
-	pubWindowSubmapSC = nh.advertise<sensor_msgs::PointCloud2>("/window_submap_raw", 100);
-	pubWindowSubmapNoGround = nh.advertise<sensor_msgs::PointCloud2>("/window_submap_noground", 100);
-
-
-    // ------------------------- 后台工作线程 -------------------------
-    std::thread posegraph_slam {process_pg}; // pose graph construction
-	std::thread lc_detection {process_lcd}; // loop closure detection
-	std::thread icp_calculation {process_icp}; // loop constraint calculation via icp
-	std::thread isam_update {process_isam}; // if you want to call less isam2 run (for saving redundant computations and no real-time visulization is required), uncommment this and comment all the above runisam2opt when node is added.
-
-	std::thread viz_map {process_viz_map}; // visualization - map (low frequency because it is heavy)
-	std::thread viz_path {process_viz_path}; // visualization - path (high frequency)
-
-    // 输入静默超时：rosbag 播完后无新消息，自动触发保存退出
-    double inputSilenceTimeout;
-    pnh.param<double>("input_silence_timeout", inputSilenceTimeout, 8.0);
-
-    // 用 spinOnce 循环替代 ros::spin()：既可响应 Ctrl+C，也可自动检测输入静默
-    ros::Rate spinRate(100); // 100 Hz
-    while (!g_shutdown_requested.load())
-    {
-        ros::spinOnce();
-        spinRate.sleep();
-
-        // 输入静默检测：超过阈值无新消息 → 认为数据源结束 → 自动保存退出
-        if (inputSilenceTimeout > 0.0 &&
-            g_has_received_input.load() &&
-            (ros::WallTime::now().toSec() - g_last_input_time.load()) > inputSilenceTimeout)
-        {
-            const double elapsed = ros::WallTime::now().toSec() - g_last_input_time.load();
-            ROS_INFO("No input for %.0f sec (> %.0f sec timeout) -- data source likely ended. Auto-saving...",
-                     elapsed, inputSilenceTimeout);
-            g_shutdown_requested.store(true);
+    // 加载 GPS（可选）
+    if (useGPS && !gpsPath.empty()) {
+        std::ifstream gpsFile(gpsPath);
+        if (gpsFile) {
+            std::string line;
+            while (std::getline(gpsFile, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                std::istringstream iss(line);
+                GpsData gps;
+                if (iss >> gps.timestamp >> gps.latitude >> gps.longitude >> gps.altitude) {
+                    gpsBuf.push(gps);
+                }
+            }
+            std::cout << "[INFO] Loaded GPS data from " << gpsPath << std::endl;
         }
     }
 
-    ROS_INFO("Shutdown triggered. Stopping processing threads...");
+    // 加载 PCD 点云并与 TUM 位姿匹配
+    int loadedCount = 0;
+    for (auto& [ts, pcdPath] : pcdFiles) {
+        auto cloud = std::make_shared<pcl::PointCloud<PointType>>();
+        if (pcl::io::loadPCDFile<PointType>(pcdPath, *cloud) == -1) {
+            std::cerr << "[WARN] Failed to load " << pcdPath << std::endl;
+            continue;
+        }
 
-    // 先等待所有线程结束（最多 300ms，因为长 sleep 都拆成了 100ms 片段）
+        // 匹配位姿：用时间戳字符串作为 key
+        std::ostringstream key;
+        key << std::fixed << std::setprecision(6) << ts;
+        auto it = tumPoses.find(key.str());
+
+        if (it != tumPoses.end()) {
+            odometryBuf.push(it->second);
+            fullResBuf.push(cloud);
+            loadedCount++;
+        } else {
+            std::cerr << "[WARN] No pose found for PCD " << pcdPath << " (ts=" << key.str() << ")" << std::endl;
+        }
+    }
+    std::cout << "[INFO] Loaded " << loadedCount << " frames (PCD + poses)" << std::endl;
+
+    if (loadedCount == 0) {
+        std::cerr << "[ERROR] No frames loaded. Check config paths and file format." << std::endl;
+        return 1;
+    }
+
+    g_has_received_input.store(true);
+    g_last_input_time.store(
+        std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count());
+
+    // -------------------- 3. 启动后台处理线程 --------------------
+    std::thread posegraph_slam {process_pg};
+    std::thread lc_detection  {process_lcd};
+    std::thread icp_calculation {process_icp};
+    std::thread isam_update   {process_isam};
+
+    // -------------------- 4. 主循环：等待处理完成 --------------------
+    // 数据已全部入队，主线程等待队列被消费完 + 输入静默超时 + Ctrl+C
+    while (!g_shutdown_requested.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        // 检查是否所有数据都已处理完
+        bool allDone = true;
+        mBuf.lock();
+        allDone = odometryBuf.empty() && fullResBuf.empty();
+        mBuf.unlock();
+
+        if (allDone && inputSilenceTimeout > 0.0 && g_has_received_input.load()) {
+            double now = std::chrono::duration<double>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            double elapsed = now - g_last_input_time.load();
+            if (elapsed > inputSilenceTimeout) {
+                std::cout << "[INFO] All frames processed and silence timeout reached (" << elapsed
+                          << "s > " << inputSilenceTimeout << "s). Auto-saving..." << std::endl;
+                g_shutdown_requested.store(true);
+            }
+        }
+    }
+
+    std::cout << "[INFO] Shutdown triggered. Stopping processing threads..." << std::endl;
+
     posegraph_slam.join();
     lc_detection.join();
     icp_calculation.join();
     isam_update.join();
-    viz_map.join();
-    viz_path.join();
 
-    ROS_INFO("All threads stopped. Saving final results -- DO NOT INTERRUPT...");
-
-    // 保存最终结果 —— 全部完成后才退出
-    ROS_INFO("  [1/6] Saving optimized poses (TUM)...");
+    // -------------------- 5. 保存最终结果 --------------------
+    std::cout << "[INFO] All threads stopped. Saving final results -- DO NOT INTERRUPT..." << std::endl;
+    std::cout << "[INFO]   [1/6] Saving optimized poses (TUM)..." << std::endl;
     saveOptimizedVerticesTUMformat(isamCurrentEstimate, keyframeTimes, pgTUMformat);
-    ROS_INFO("  [2/6] Saving odometry poses (KITTI)...");
+    std::cout << "[INFO]   [2/6] Saving odometry poses (KITTI)..." << std::endl;
     saveOdometryVerticesKITTIformat(odomKITTIformat);
-    ROS_INFO("  [3/6] Saving pose graph (g2o)...");
+    std::cout << "[INFO]   [3/6] Saving pose graph (g2o)..." << std::endl;
     saveGTSAMgraphG2oFormat(isamCurrentEstimate);
-    ROS_INFO("  [4/6] Saving global map (PCD)...");
+    std::cout << "[INFO]   [4/6] Saving global map (PCD)..." << std::endl;
     saveGlobalMap(save_directory + "global_map.pcd");
-    ROS_INFO("  [5/6] Saving keyframes...");
+    std::cout << "[INFO]   [5/6] Saving keyframes..." << std::endl;
     saveKeyframes();
-    ROS_INFO("  [6/6] Recovering all poses (TUM)...");
+    std::cout << "[INFO]   [6/6] Recovering all poses (TUM)..." << std::endl;
     recoverAllPosesTUM(save_directory + "all_optimized_poses.txt");
 
     pgTimeSaveStream.close();
 
-    ROS_INFO("All saves complete. Shutting down cleanly.");
-    ros::shutdown();
-
+    std::cout << "[INFO] All saves complete. Exiting." << std::endl;
     return 0;
 }
