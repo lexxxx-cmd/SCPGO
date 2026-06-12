@@ -44,14 +44,6 @@
 // Eigen 3.4 removed the ScalarBinaryOpTraits class template that older Ceres
 // tries to specialize in jet.h. Provide a minimal primary template so the
 // Ceres partial specializations compile.
-#if EIGEN_VERSION_AT_LEAST(3,4,0)
-namespace Eigen {
-template <typename BinaryOp, typename LhsScalar, typename RhsScalar>
-struct ScalarBinaryOpTraits {
-  enum { Defined = 0 };
-};
-}  // namespace Eigen
-#endif
 
 #include <ceres/ceres.h>
 
@@ -1510,8 +1502,8 @@ int main(int argc, char **argv)
     scMaximumRadius   = getParamOrDefaultDeep<double>(cfg, "scan_context.max_radius", 80.0);
     scManager.LIDAR_HEIGHT = getParamOrDefaultDeep<double>(cfg, "scan_context.lidar_height", 2.0);
 
-    useGroundRemoval        = getParamOrDefault<bool>(cfg, "use_ground_removal", true);
-    useICPSubmapEnhancement = getParamOrDefault<bool>(cfg, "use_icp_submap_enhancement", true);
+    useGroundRemoval        = getParamOrDefault<bool>(cfg, "use_ground_removal", false);
+    useICPSubmapEnhancement = getParamOrDefault<bool>(cfg, "use_icp_submap_enhancement", false);
 
     icpMaxCorrespondenceDistance = getParamOrDefaultDeep<double>(cfg, "icp.max_correspondence_distance", 150.0);
     icpFitnessScoreThreshold     = getParamOrDefaultDeep<double>(cfg, "icp.fitness_score_threshold", 0.3);
@@ -1547,7 +1539,7 @@ int main(int argc, char **argv)
 
     // 下采样滤波器
     float sc_filter_size = 0.05;
-    float icp_filter_size = 0.1;
+    float icp_filter_size = 0.3;
     downSizeFilterScancontext.setLeafSize(sc_filter_size, sc_filter_size, sc_filter_size);
     downSizeFilterICP.setLeafSize(icp_filter_size, icp_filter_size, icp_filter_size);
     downSizeFilterMapPGO.setLeafSize(mapVizFilterSize, mapVizFilterSize, mapVizFilterSize);

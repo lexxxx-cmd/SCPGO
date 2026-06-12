@@ -1,4 +1,5 @@
 output/
+all_pcd_body/
 
 # IDE
 .vs/
