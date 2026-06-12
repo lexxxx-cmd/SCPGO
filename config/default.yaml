@@ -1,0 +1,61 @@
+# ============================================================
+# SCPGO: Scan Context + Pose Graph Optimization
+# YAML configuration (replaces ROS launch file)
+# ============================================================
+
+# -------------------- Input Data Paths --------------------
+input:
+  pcd_dir: "all_pcd_body/"                    # Directory containing per-frame PCD files
+  tum_poses: "all_pcd_body/lidar_poses.txt"   # TUM format: timestamp tx ty tz qx qy qz qw
+  gps_file: ""                                # Optional GPS CSV: timestamp,lat,lon,alt
+  use_gps: false
+
+# -------------------- Output Paths --------------------
+output:
+  save_directory: "output/"
+  save_keyframes: true
+  save_keyframes_directory: "output/"
+  save_keyframes_full_cloud: true
+
+# -------------------- Keyframe Selection --------------------
+keyframe:
+  meter_gap: 2.0       # add keyframe every N meters of translation
+  deg_gap: 10.0         # add keyframe every N degrees of rotation
+
+# -------------------- Scan Context --------------------
+scan_context:
+  dist_thres: 0.2       # SC distance threshold for loop detection (0.1-0.6)
+  max_radius: 80.0      # max radius in meters (80 outdoor, 20-40 indoor)
+  lidar_height: 2.0     # LiDAR mounting height (0 if scans are in base frame)
+
+# -------------------- Feature Switches --------------------
+use_ground_removal: true             # RANSAC ground removal
+use_icp_submap_enhancement: true     # sliding window + spatial neighbors for ICP
+
+# -------------------- ICP Loop Verification --------------------
+icp:
+  max_correspondence_distance: 150.0
+  fitness_score_threshold: 0.3
+  min_source_points: 50
+  min_target_points: 50
+  max_translation: 50.0
+  max_rotation_deg: 30.0
+
+# -------------------- Loop Closure Robust Kernel --------------------
+loop:
+  noise_score: 0.5
+  kernel_param: 1.0
+  kernel_type: "geman_mcclure"    # cauchy / dcs / geman_mcclure
+
+# -------------------- Spatial Loop Closure --------------------
+spatial_loop:
+  enabled: true                    # detect loops by Euclidean distance (bypasses SC)
+  radius: 10.0                    # Euclidean distance threshold (m)
+  fitness_thres: 0.1              # stricter ICP fitness than SC loops
+  min_separation: 50              # minimum keyframe index gap
+
+# -------------------- Map Visualization --------------------
+mapviz_filter_size: 0.4           # leaf size for global map downsampling
+
+# -------------------- Graceful Shutdown --------------------
+input_silence_timeout: 8.0        # auto-exit after N seconds of inactivity (0=disabled)
