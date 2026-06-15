@@ -860,8 +860,11 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
         // 对合并空间近邻后的 target 再次降采样
         {
             pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
-            downSizeFilterICP.setInputCloud(targetKeyframeCloud);
-            downSizeFilterICP.filter(*cloud_temp);
+            {
+                std::lock_guard<std::mutex> lock(mICPFilter);
+                downSizeFilterICP.setInputCloud(targetKeyframeCloud);
+                downSizeFilterICP.filter(*cloud_temp);
+            }
             *targetKeyframeCloud = *cloud_temp;
         }
     } else {
@@ -1170,10 +1173,17 @@ void process_pg()
             // if want to print the current graph, use gtSAMgraph.print("\nFactor Graph:\n");
 
             // save utility
-            pgTimeSaveStream << timeLaser << std::endl; // path 
+            pgTimeSaveStream << timeLaser << std::endl; // path
+
+            // 模拟传感器延时：让 isam/lcd 有机会在同频率下穿插运行
+            if (simulatedSensorHz > 0.0) {
+                auto frameDelay = std::chrono::milliseconds(
+                    static_cast<int>(1000.0 / simulatedSensorHz));
+                std::this_thread::sleep_for(frameDelay);
+            }
         }
 
-        // ps. 
+        // ps.
         // scan context detector is running in another thread (in constant Hz, e.g., 1 Hz)
         // pub path and point cloud in another thread
 
