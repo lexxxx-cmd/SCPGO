@@ -82,28 +82,53 @@ struct GpsData {
 };
 
 // 从 YAML 节点读取参数，带默认值回退
+// NOTE: 全程使用 const 引用/指针 + const operator[]，
+//       避免 yaml-cpp 0.9.0 非 const operator[] 的 bug（会向内部树插入空条目）。
 template<typename T>
 T getParamOrDefault(const YAML::Node& node, const std::string& key, const T& default_val)
 {
-    if (!node[key]) return default_val;
-    return node[key].as<T>();
+    if (!node.IsMap() || !node[key]) {
+        if (!node[key])
+            std::cerr << "[CONFIG] key='" << key << "' NOT_FOUND, using default" << std::endl;
+        return default_val;
+    }
+    try {
+        return node[key].as<T>();
+    } catch (const YAML::Exception& e) {
+        std::cerr << "[CONFIG] key='" << key << "' CONVERSION_FAILED: " << e.what()
+                  << ", using default" << std::endl;
+        return default_val;
+    }
 }
 
 // 辅助：从 "a.b.c" 格式的 key 中逐级查找 YAML 节点
 template<typename T>
 T getParamOrDefaultDeep(const YAML::Node& root, const std::string& dotkey, const T& default_val)
 {
-    YAML::Node cur = root;
-    size_t pos = 0, next;
-    while ((next = dotkey.find('.', pos)) != std::string::npos) {
-        std::string part = dotkey.substr(pos, next - pos);
-        if (!cur[part]) return default_val;
-        cur = cur[part];
-        pos = next + 1;
+    const YAML::Node* node = &root;
+    std::istringstream ss(dotkey);
+    std::string segment;
+    while (std::getline(ss, segment, '.')) {
+        if (!node->IsMap()) {
+            std::cerr << "[CONFIG] key='" << dotkey << "' NOT_A_MAP at segment='" << segment
+                      << "', using default" << std::endl;
+            return default_val;
+        }
+        const YAML::Node& child = (*node)[segment];  // const operator[] — 不会触发 0.9.0 bug
+        if (!child) {
+            std::cerr << "[CONFIG] key='" << dotkey << "' KEY_MISSING at segment='" << segment
+                      << "', using default" << std::endl;
+            return default_val;
+        }
+        node = &child;
     }
-    std::string last = dotkey.substr(pos);
-    if (!cur[last]) return default_val;
-    return cur[last].as<T>();
+    try {
+        return node->as<T>();
+    } catch (const YAML::Exception& e) {
+        std::cerr << "[CONFIG] key='" << dotkey << "' CONVERSION_FAILED: " << e.what()
+                  << ", using default" << std::endl;
+        return default_val;
+    }
 }
 
 // ------------------------------------------------------------
@@ -137,8 +162,9 @@ double keyframeMeterGap;
 double keyframeDegGap, keyframeRadGap;
 double translationAccumulated = 1000000.0; // large value means must add the first given frame.
 double rotaionAccumulated = 1000000.0; // large value means must add the first given frame.
+double simulatedSensorHz = 10.0;       // 批量模式传感器模拟频率 (Hz), 0=全速
 
-bool isNowKeyFrame = false; 
+bool isNowKeyFrame = false;
 
 Pose6D odom_pose_prev {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}; // init
 Pose6D odom_pose_curr {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}; // init pose is zero
@@ -166,6 +192,10 @@ bool useSpatialLoopClosure = true;        // 是否启用空间近邻回环
 double spatialLoopRadius = 10.0;          // 欧氏距离阈值 (m)
 double spatialLoopFitnessThres = 0.1;     // 比 SC 回环更严格的 ICP fitness 阈值
 int spatialLoopMinSeparation = 50;        // 最少间隔关键帧数（排除近邻自匹配）
+
+// SC 回环世界系距离预检（从配置文件读取）
+// 只允许世界坐标系下距离 < 该阈值的关键帧对进入 ICP 验证
+double scLoopMaxWorldDistance = 30.0;     // 世界系最大距离 (m)
 
 // ------------------------- 输入缓存：回调只负责入队 -------------------------
 std::queue<OdomData> odometryBuf;
@@ -217,6 +247,7 @@ SCManager scManager;
 double scDistThres, scMaximumRadius;
 
 pcl::VoxelGrid<PointType> downSizeFilterICP;
+std::mutex mICPFilter;  // 保护 downSizeFilterICP 的多线程访问
 
 // ICP 回环验证参数（从 launch 文件读取）
 double icpMaxCorrespondenceDistance;
@@ -326,7 +357,7 @@ void saveGTSAMgraphG2oFormat(const gtsam::Values& _estimates)
     // cout << "****************************************************" << endl; 
     cout << "Saving the posegraph ..." << endl; // giseop
 
-    pgG2oSaveStream = std::fstream(save_directory + "gragh.g2o", std::fstream::out);
+    pgG2oSaveStream = std::fstream(save_directory + "graph.g2o", std::fstream::out);
 
     int pose_idx = 0;
     for(const auto& _pose6d: keyframePoses) {
@@ -386,10 +417,10 @@ void saveOptimizedVerticesTUMformat(gtsam::Values _estimates, const std::vector<
 }
 
 // 读取 TUM 格式位姿文件：timestamp tx ty tz qx qy qz qw
-// 返回 map：PCD 文件名 stem → OdomData
-std::map<std::string, OdomData> loadTumPoses(const std::string& path)
+// PCD 文件按时间戳命名且已排序，这里按行序读入 deque，与 scanPcdDirectory 顺序对齐
+std::deque<OdomData> loadTumPoses(const std::string& path)
 {
-    std::map<std::string, OdomData> result;
+    std::deque<OdomData> result;
     std::ifstream ifs(path);
     if (!ifs) {
         std::cerr << "[ERROR] Cannot open TUM poses file: " << path << std::endl;
@@ -402,10 +433,7 @@ std::map<std::string, OdomData> loadTumPoses(const std::string& path)
         OdomData odom;
         if (iss >> odom.timestamp >> odom.x >> odom.y >> odom.z
                 >> odom.qx >> odom.qy >> odom.qz >> odom.qw) {
-            // 用时间戳字符串作为 key（与 PCD 文件名匹配）
-            std::ostringstream key;
-            key << std::fixed << std::setprecision(6) << odom.timestamp;
-            result[key.str()] = odom;
+            result.push_back(odom);
         }
     }
     std::cout << "[INFO] Loaded " << result.size() << " TUM poses from " << path << std::endl;
@@ -754,8 +782,11 @@ void loopFindNearKeyframesCloud( pcl::PointCloud<PointType>::Ptr& nearKeyframes,
 
     // downsample near keyframes
     pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
-    downSizeFilterICP.setInputCloud(nearKeyframes);
-    downSizeFilterICP.filter(*cloud_temp);
+    {
+        std::lock_guard<std::mutex> lock(mICPFilter);
+        downSizeFilterICP.setInputCloud(nearKeyframes);
+        downSizeFilterICP.filter(*cloud_temp);
+    }
     *nearKeyframes = *cloud_temp;
 } // loopFindNearKeyframesCloud
 
@@ -781,8 +812,11 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
         // 降采样
         {
             pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
-            downSizeFilterICP.setInputCloud(cureKeyframeCloud);
-            downSizeFilterICP.filter(*cloud_temp);
+            {
+                std::lock_guard<std::mutex> lock(mICPFilter);
+                downSizeFilterICP.setInputCloud(cureKeyframeCloud);
+                downSizeFilterICP.filter(*cloud_temp);
+            }
             *cureKeyframeCloud = *cloud_temp;
         }
 
@@ -964,7 +998,8 @@ void process_pg()
             pcl::PointCloud<PointType>::Ptr thisKeyFrame = fullResBuf.front();
             fullResBuf.pop();
 
-            Pose6D pose_curr = getOdom(odometryBuf.front());
+            OdomData odom_curr = odometryBuf.front();   // save quaternion before conversion
+            Pose6D pose_curr = getOdom(odom_curr);
             odometryBuf.pop();
 
             // find nearest gps
@@ -981,11 +1016,16 @@ void process_pg()
                 }
                 gpsBuf.pop();
             }
-            mBuf.unlock(); 
+            mBuf.unlock();
+
+            // Paired publish via Foxglove WebSocket (cloud → pose, same timestamp)
+            if (g_wsPublisher.enabled) {
+                g_wsPublisher.publishPairedFrame(thisKeyFrame, timeLaserOdometry, odom_curr);
+            }
 
             //
             // Early reject by counting local delta movement (for equi-spereated kf drop)
-            // 
+            //
             odom_pose_prev = odom_pose_curr;
             odom_pose_curr = pose_curr;
             Pose6D dtf = diffTransformation(odom_pose_prev, odom_pose_curr); // dtf means delta_transform
@@ -1166,6 +1206,34 @@ void performSCLoopClosure(void)
             mBuf.unlock();
             return;
         }
+        mBuf.unlock();
+
+        // ---- 世界系距离预检：拒绝相距过远的关键帧对 ----
+        // 用 ISAM2 优化后的位姿（keyframePosesUpdated）计算世界系欧氏距离，
+        // 防止 SC 描述子误匹配导致的远距离假阳性回环。
+        {
+            mKF.lock();
+            if (prev_node_idx < (int)keyframePosesUpdated.size() &&
+                curr_node_idx < (int)keyframePosesUpdated.size()) {
+                double dx = keyframePosesUpdated[curr_node_idx].x - keyframePosesUpdated[prev_node_idx].x;
+                double dy = keyframePosesUpdated[curr_node_idx].y - keyframePosesUpdated[prev_node_idx].y;
+                double dz = keyframePosesUpdated[curr_node_idx].z - keyframePosesUpdated[prev_node_idx].z;
+                double worldDist = std::sqrt(dx*dx + dy*dy + dz*dz);
+                mKF.unlock();
+
+                if (worldDist > scLoopMaxWorldDistance) {
+                    cout << "[SC Loop] Reject: world distance " << worldDist
+                         << "m > " << scLoopMaxWorldDistance
+                         << "m (SC matched " << prev_node_idx << " ↔ " << curr_node_idx << ")"
+                         << endl;
+                    return;
+                }
+            } else {
+                mKF.unlock();
+            }
+        }
+
+        mBuf.lock();
         scLoopICPBuf.push(std::pair<int, int>(prev_node_idx, curr_node_idx));
         mBuf.unlock();
 
@@ -1332,6 +1400,18 @@ void process_isam(void)
             saveOdometryVerticesKITTIformat(odomKITTIformat); // pose
             saveGTSAMgraphG2oFormat(isamCurrentEstimate);
             mKF.unlock();
+
+            // Publish global point cloud map after each PGO optimization
+            if (g_wsPublisher.enabled) {
+                pcl::PointCloud<PointType>::Ptr globalMap(new pcl::PointCloud<PointType>());
+                mKF.lock();
+                for (size_t i = 0; i < keyframeLaserCloudsFull.size() && i < keyframePosesUpdated.size(); i++) {
+                    *globalMap += *local2global(keyframeLaserCloudsFull[i], keyframePosesUpdated[i]);
+                }
+                mKF.unlock();
+                double ts = keyframeTimes.empty() ? 0.0 : keyframeTimes.back();
+                g_wsPublisher.publishGlobalMap(globalMap, ts);
+            }
         }
     }
 }
@@ -1485,7 +1565,19 @@ int main(int argc, char **argv)
     // -------------------- 1. 加载 YAML 配置 --------------------
     std::string configPath = (argc >= 2) ? argv[1] : "config/default.yaml";
     std::cout << "[INFO] Loading config: " << configPath << std::endl;
-    YAML::Node cfg = YAML::LoadFile(configPath);
+
+    YAML::Node cfg;
+    try {
+        cfg = YAML::LoadFile(configPath);
+        if (!cfg.IsMap()) {
+            std::cerr << "[FATAL] Config file parsed but root is not a YAML map. "
+                      << "All parameters will use defaults." << std::endl;
+        }
+    } catch (const YAML::Exception& e) {
+        std::cerr << "[FATAL] YAML parse error: " << e.what() << std::endl;
+        std::cerr << "[FATAL] Please fix the YAML syntax in: " << configPath << std::endl;
+        return 1;
+    }
 
     // 输出路径
     save_directory              = getParamOrDefaultDeep<std::string>(cfg, "output.save_directory", "output/");
@@ -1510,9 +1602,10 @@ int main(int argc, char **argv)
     scDistThres       = getParamOrDefaultDeep<double>(cfg, "scan_context.dist_thres", 0.2);
     scMaximumRadius   = getParamOrDefaultDeep<double>(cfg, "scan_context.max_radius", 80.0);
     scManager.LIDAR_HEIGHT = getParamOrDefaultDeep<double>(cfg, "scan_context.lidar_height", 2.0);
+    scLoopMaxWorldDistance = getParamOrDefaultDeep<double>(cfg, "scan_context.max_world_distance", 30.0);
 
-    useGroundRemoval        = getParamOrDefault<bool>(cfg, "use_ground_removal", false);
-    useICPSubmapEnhancement = getParamOrDefault<bool>(cfg, "use_icp_submap_enhancement", false);
+    useGroundRemoval        = getParamOrDefault<bool>(cfg, "use_ground_removal", true);
+    useICPSubmapEnhancement = getParamOrDefault<bool>(cfg, "use_icp_submap_enhancement", true);
 
     icpMaxCorrespondenceDistance = getParamOrDefaultDeep<double>(cfg, "icp.max_correspondence_distance", 150.0);
     icpFitnessScoreThreshold     = getParamOrDefaultDeep<double>(cfg, "icp.fitness_score_threshold", 0.3);
@@ -1584,27 +1677,25 @@ int main(int argc, char **argv)
         }
     }
 
-    // 加载 PCD 点云并与 TUM 位姿匹配
+    // 加载 PCD 点云并与 TUM 位姿匹配（两个数据源已按时间戳排序，顺序对齐）
     int loadedCount = 0;
     for (auto& [ts, pcdPath] : pcdFiles) {
+        if (tumPoses.empty()) {
+            std::cerr << "[WARN] No more TUM poses, skipping remaining PCDs" << std::endl;
+            break;
+        }
+
         auto cloud = std::make_shared<pcl::PointCloud<PointType>>();
         if (pcl::io::loadPCDFile<PointType>(pcdPath, *cloud) == -1) {
             std::cerr << "[WARN] Failed to load " << pcdPath << std::endl;
+            tumPoses.pop_front();  // 跳过此帧位姿以保持对齐
             continue;
         }
 
-        // 匹配位姿：用时间戳字符串作为 key
-        std::ostringstream key;
-        key << std::fixed << std::setprecision(6) << ts;
-        auto it = tumPoses.find(key.str());
-
-        if (it != tumPoses.end()) {
-            odometryBuf.push(it->second);
-            fullResBuf.push(cloud);
-            loadedCount++;
-        } else {
-            std::cerr << "[WARN] No pose found for PCD " << pcdPath << " (ts=" << key.str() << ")" << std::endl;
-        }
+        odometryBuf.push(tumPoses.front());
+        tumPoses.pop_front();
+        fullResBuf.push(cloud);
+        loadedCount++;
     }
     std::cout << "[INFO] Loaded " << loadedCount << " frames (PCD + poses)" << std::endl;
 
@@ -1616,6 +1707,25 @@ int main(int argc, char **argv)
     g_has_received_input.store(true);
     g_last_input_time.store(
         std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count());
+
+    // -------------------- Foxglove WebSocket init --------------------
+    {
+        bool wsEnabled = getParamOrDefaultDeep<bool>(cfg, "websocket.enabled", true);
+        if (wsEnabled) {
+            std::string wsHost = getParamOrDefaultDeep<std::string>(cfg, "websocket.host",
+                                                                   std::string("0.0.0.0"));
+            uint16_t wsPort = static_cast<uint16_t>(
+                getParamOrDefaultDeep<int>(cfg, "websocket.port", 8765));
+            bool wsPubPC  = getParamOrDefaultDeep<bool>(cfg, "websocket.publish_pointcloud", true);
+            bool wsPubPose = getParamOrDefaultDeep<bool>(cfg, "websocket.publish_pose", true);
+            double wsLeaf = getParamOrDefaultDeep<double>(cfg, "websocket.pointcloud_downsample_leaf", 0.1);
+            int wsMaxPts  = getParamOrDefaultDeep<int>(cfg, "websocket.max_points_per_message", 50000);
+            g_wsPublisher.publishICPDetail   = getParamOrDefaultDeep<bool>(cfg, "websocket.publish_icp_detail", true);
+            g_wsPublisher.publishGlobalMapFlag = getParamOrDefaultDeep<bool>(cfg, "websocket.publish_global_map", true);
+            g_wsPublisher.globalMapLeafSize  = getParamOrDefaultDeep<double>(cfg, "websocket.global_map_leaf_size", 0.2);
+            g_wsPublisher.init(wsHost, wsPort, wsPubPC, wsPubPose, wsLeaf, wsMaxPts);
+        }
+    }
 
     // -------------------- 3. 启动后台处理线程 --------------------
     std::thread posegraph_slam {process_pg};
@@ -1652,6 +1762,9 @@ int main(int argc, char **argv)
     lc_detection.join();
     icp_calculation.join();
     isam_update.join();
+
+    // Shutdown WebSocket before saving results
+    g_wsPublisher.shutdown();
 
     // -------------------- 5. 保存最终结果 --------------------
     std::cout << "[INFO] All threads stopped. Saving final results -- DO NOT INTERRUPT..." << std::endl;
