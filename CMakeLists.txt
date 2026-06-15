@@ -14,6 +14,17 @@ find_package(CUDAToolkit REQUIRED)
 find_package(GTSAM REQUIRED)
 find_package(Boost REQUIRED COMPONENTS serialization thread timer chrono filesystem)
 find_package(yaml-cpp REQUIRED)
+find_package(nlohmann_json REQUIRED)
+find_package(OpenSSL REQUIRED)
+
+# websocketpp — header-only WebSocket library, auto-downloaded from GitHub
+include(FetchContent)
+FetchContent_Declare(
+  websocketpp
+  GIT_REPOSITORY https://github.com/jcelerier/websocketpp.git
+  GIT_TAG        ossia/2024-12-18
+)
+FetchContent_MakeAvailable(websocketpp)
 
 # -------------------- CUDA imported targets (compatibility) --------------------
 # PCL and other deps may reference CUDA:: targets that the old FindCUDA created
@@ -31,7 +42,12 @@ endforeach()
 # -------------------- Executable --------------------
 add_executable(alaserPGO
   src/laserPosegraphOptimization.cpp
+  src/websocket_publisher.cpp
   include/SCPGO/scancontext/Scancontext.cpp
+  src/foxglove/base64.cpp
+  src/foxglove/parameter.cpp
+  src/foxglove/serialization.cpp
+  src/foxglove/server_factory.cpp
 )
 
 target_include_directories(alaserPGO PRIVATE
@@ -41,9 +57,14 @@ target_include_directories(alaserPGO PRIVATE
   ${CERES_INCLUDE_DIRS}
   ${GTSAM_INCLUDE_DIR}
   ${CUDAToolkit_INCLUDE_DIRS}
+  ${websocketpp_SOURCE_DIR}
 )
 
-target_compile_options(alaserPGO PRIVATE ${OpenMP_CXX_FLAGS})
+target_compile_options(alaserPGO PRIVATE
+  ${OpenMP_CXX_FLAGS}
+  $<$<CXX_COMPILER_ID:MSVC>:/utf-8>  # 强制 MSVC 用 UTF-8 编码，避免 GBK 误解析中文注释
+  $<$<CXX_COMPILER_ID:MSVC>:/bigobj>  # websocketpp 模板展开导致节数超限
+)
 
 target_link_libraries(alaserPGO PRIVATE
   ${PCL_LIBRARIES}
@@ -57,4 +78,7 @@ target_link_libraries(alaserPGO PRIVATE
   Boost::filesystem
   OpenMP::OpenMP_CXX
   CUDA::cudart
+  nlohmann_json::nlohmann_json
+  OpenSSL::SSL
+  OpenSSL::Crypto
 )
