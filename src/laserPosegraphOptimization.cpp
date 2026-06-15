@@ -65,17 +65,15 @@
 #include "SCPGO/aloam_velodyne/tic_toc.h"
 
 #include "SCPGO/scancontext/Scancontext.h"
+#include "SCPGO/websocket_publisher.h"
 
 // ------------------------------------------------------------
 // 替代 ROS 消息类型的纯 C++ 数据结构
 // ------------------------------------------------------------
 
 // TUM 格式位姿数据（替代 nav_msgs::Odometry）
-struct OdomData {
-    double timestamp;
-    double x, y, z;
-    double qx, qy, qz, qw;  // 四元数
-};
+// NOTE: OdomData is now defined in websocket_publisher.h so it is
+//       visible to both the main TU and the publisher implementation.
 
 // GPS 数据（替代 sensor_msgs::NavSatFix）
 struct GpsData {
@@ -178,6 +176,9 @@ std::set<std::pair<int, int>> processedLoopPairs; // 已处理的回环对，防
 
 std::mutex mBuf;
 std::mutex mKF;
+
+// Foxglove WebSocket publisher for real-time streaming
+static WebSocketPublisher g_wsPublisher;
 
 double timeLaserOdometry = 0.0;
 double timeLaser = 0.0;
@@ -853,6 +854,13 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
     icp.setEuclideanFitnessEpsilon(1e-6);
     icp.setRANSACIterations(0);
 
+    // Publish ICP source/target for visualization (before alignment)
+    if (g_wsPublisher.enabled) {
+        double ts = (_curr_kf_idx < (int)keyframeTimes.size())
+                    ? keyframeTimes[_curr_kf_idx] : timeLaserOdometry;
+        g_wsPublisher.publishICP(cureKeyframeCloud, targetKeyframeCloud, ts);
+    }
+
     // Align pointclouds
     icp.setInputSource(cureKeyframeCloud);
     icp.setInputTarget(targetKeyframeCloud);
@@ -934,7 +942,8 @@ void process_pg()
 {
     while(!g_shutdown_requested.load())
     {
-		while ( !g_shutdown_requested.load() && !odometryBuf.empty() && !fullResBuf.empty() )
+		// 每次外循环只消费一帧（模拟 ROS callback 节奏），让 isam/lcd 穿插
+		if ( !odometryBuf.empty() && !fullResBuf.empty() )
         {
             //
             // pop and check keyframe is or not  
@@ -944,7 +953,7 @@ void process_pg()
             if (odometryBuf.empty())
             {
                 mBuf.unlock();
-                break;
+                continue;
             }
 
             timeLaserOdometry = odometryBuf.front().timestamp;
@@ -1524,6 +1533,7 @@ int main(int argc, char **argv)
 
     double mapVizFilterSize  = getParamOrDefault<double>(cfg, "mapviz_filter_size", 0.4);
     double inputSilenceTimeout = getParamOrDefault<double>(cfg, "input_silence_timeout", 8.0);
+    simulatedSensorHz = getParamOrDefault<double>(cfg, "simulated_sensor_hz", 10.0);
 
     useGPS = getParamOrDefaultDeep<bool>(cfg, "input.use_gps", false);
 
@@ -1539,7 +1549,7 @@ int main(int argc, char **argv)
 
     // 下采样滤波器
     float sc_filter_size = 0.05;
-    float icp_filter_size = 0.3;
+    float icp_filter_size = 0.4;
     downSizeFilterScancontext.setLeafSize(sc_filter_size, sc_filter_size, sc_filter_size);
     downSizeFilterICP.setLeafSize(icp_filter_size, icp_filter_size, icp_filter_size);
     downSizeFilterMapPGO.setLeafSize(mapVizFilterSize, mapVizFilterSize, mapVizFilterSize);
