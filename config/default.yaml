@@ -19,17 +19,18 @@ output:
 
 # -------------------- Keyframe Selection --------------------
 keyframe:
-  meter_gap: 2.0       # add keyframe every N meters of translation
-  deg_gap: 30.0         # add keyframe every N degrees of rotation
+  meter_gap: 0.5       # add keyframe every N meters of translation
+  deg_gap: 10.0         # add keyframe every N degrees of rotation
 
 # -------------------- Scan Context --------------------
 scan_context:
   dist_thres: 0.4              # SC descriptor distance threshold (0.1-0.6)
   max_radius: 80.0             # max radius in meters (80 outdoor, 20-40 indoor)
-  lidar_height: 0.3            # LiDAR mounting height (0 if scans are in base frame)
+  lidar_height: 1            # LiDAR mounting height (0 if scans are in base frame)
   max_world_distance: 6.0     # reject SC loops where world-frame distance > N meters
 
 # -------------------- Feature Switches --------------------
+passthrough_mode: false              # skip keyframe selection & loop closure, process all frames as-is
 use_ground_removal: false             # RANSAC ground removal
 use_icp_submap_enhancement: false     # sliding window + spatial neighbors for ICP
 
