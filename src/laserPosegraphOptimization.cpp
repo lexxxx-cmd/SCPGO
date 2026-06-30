@@ -202,6 +202,10 @@ int spatialLoopMinSeparation = 50;        // 最少间隔关键帧数（排除�
 // 只允许世界坐标系下距离 < 该阈值的关键帧对进入 ICP 验证
 double scLoopMaxWorldDistance = 30.0;     // 世界系最大距离 (m)
 
+// 回环帧间隔抑制：成功加边后，后续 N 帧不参与回环检测
+int loopMinFrameGap = 5;                  // 最小帧间隔
+std::atomic<int> lastLoopClosureKeyframeIdx{-9999};   // 上次成功加回环边的当前帧索引
+
 // ------------------------- 输入缓存：回调只负责入队 -------------------------
 std::queue<OdomData> odometryBuf;
 std::queue<pcl::PointCloud<PointType>::Ptr> fullResBuf;
@@ -789,7 +793,7 @@ void loopFindNearKeyframesCloud( pcl::PointCloud<PointType>::Ptr& nearKeyframes,
 
 
 // 用 ICP 估计回环两端的精确相对位姿；失败则返回空值。
-std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx, double _fitness_threshold = -1.0 )
+std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx, double _fitness_threshold = -1.0, double* out_fitness_score = nullptr )
 {
     double effectiveFitnessThres = (_fitness_threshold >= 0.0) ? _fitness_threshold : icpFitnessScoreThreshold;
     // parse pointclouds
@@ -961,7 +965,10 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
             return std::nullopt;
         }
 
-        cout << "[ICP] Passed: fitness=" << icp.getFitnessScore()
+        double fitnessOut = icp.getFitnessScore();
+        if (out_fitness_score) *out_fitness_score = fitnessOut;
+
+        cout << "[ICP] Passed: fitness=" << fitnessOut
              << ", corr_trans=" << transMag << "m"
              << ", corr_rot=" << rad2deg(rotMag) << "°"
              << ", consistency_trans=" << consistencyTrans << "m"
@@ -1225,15 +1232,19 @@ void performSCLoopClosure(void)
     if( kf_size < scManager.NUM_EXCLUDE_RECENT) // do not try too early
         return;
 
+    // 帧间隔抑制：上次加边后的 N 帧内不检测
+    int curr_node_idx_sc = kf_size - 1;
+    if (curr_node_idx_sc - lastLoopClosureKeyframeIdx.load() < loopMinFrameGap)
+        return;
+
     auto detectResult = scManager.detectLoopClosureID(); // first: nn index, second: yaw diff
     int SCclosestHistoryFrameID = detectResult.first;
     if( SCclosestHistoryFrameID != -1 ) {
         const int prev_node_idx = SCclosestHistoryFrameID;
-        const int curr_node_idx = kf_size - 1; // because cpp starts 0 and ends n-1
 
         mBuf.lock();
         // 去重：已成功处理过的回环对不再重复入队
-        if (processedLoopPairs.count({prev_node_idx, curr_node_idx})) {
+        if (processedLoopPairs.count({prev_node_idx, curr_node_idx_sc})) {
             mBuf.unlock();
             return;
         }
@@ -1245,17 +1256,17 @@ void performSCLoopClosure(void)
         {
             mKF.lock();
             if (prev_node_idx < (int)keyframePosesUpdated.size() &&
-                curr_node_idx < (int)keyframePosesUpdated.size()) {
-                double dx = keyframePosesUpdated[curr_node_idx].x - keyframePosesUpdated[prev_node_idx].x;
-                double dy = keyframePosesUpdated[curr_node_idx].y - keyframePosesUpdated[prev_node_idx].y;
-                double dz = keyframePosesUpdated[curr_node_idx].z - keyframePosesUpdated[prev_node_idx].z;
+                curr_node_idx_sc < (int)keyframePosesUpdated.size()) {
+                double dx = keyframePosesUpdated[curr_node_idx_sc].x - keyframePosesUpdated[prev_node_idx].x;
+                double dy = keyframePosesUpdated[curr_node_idx_sc].y - keyframePosesUpdated[prev_node_idx].y;
+                double dz = keyframePosesUpdated[curr_node_idx_sc].z - keyframePosesUpdated[prev_node_idx].z;
                 double worldDist = std::sqrt(dx*dx + dy*dy + dz*dz);
                 mKF.unlock();
 
                 if (worldDist > scLoopMaxWorldDistance) {
                     cout << "[SC Loop] Reject: world distance " << worldDist
                          << "m > " << scLoopMaxWorldDistance
-                         << "m (SC matched " << prev_node_idx << " ↔ " << curr_node_idx << ")"
+                         << "m (SC matched " << prev_node_idx << " ↔ " << curr_node_idx_sc << ")"
                          << endl;
                     return;
                 }
@@ -1265,10 +1276,10 @@ void performSCLoopClosure(void)
         }
 
         mBuf.lock();
-        scLoopICPBuf.push(std::pair<int, int>(prev_node_idx, curr_node_idx));
+        scLoopICPBuf.push(std::pair<int, int>(prev_node_idx, curr_node_idx_sc));
         mBuf.unlock();
 
-        cout << "Loop detected! - between " << prev_node_idx << " and " << curr_node_idx << "" << endl;
+        cout << "Loop detected! - between " << prev_node_idx << " and " << curr_node_idx_sc << "" << endl;
     }
 } // performSCLoopClosure
 
@@ -1285,6 +1296,9 @@ void performSpatialLoopClosure(void)
 
     int curr_node_idx = kf_size - 1;
     if (curr_node_idx < spatialLoopMinSeparation) return;
+
+    // 帧间隔抑制：上次加边后的 N 帧内不检测
+    if (curr_node_idx - lastLoopClosureKeyframeIdx.load() < loopMinFrameGap) return;
 
     double radiusSq = spatialLoopRadius * spatialLoopRadius;
     std::vector<std::pair<int, double>> neighbors; // (idx, distSq)
@@ -1304,16 +1318,21 @@ void performSpatialLoopClosure(void)
     }
     mKF.unlock();
 
+    if (neighbors.empty()) return;
+
     // 按距离排序（近的优先处理）
     std::sort(neighbors.begin(), neighbors.end(),
               [](const auto& a, const auto& b) { return a.second < b.second; });
 
-    int acceptedCount = 0;
-    const int MAX_SPATIAL_LOOPS_PER_CYCLE = 3; // 每次最多接受 3 个空间回环
+    // 跑所有候选的 ICP，只保留 fitness 最小的那一条
+    struct Candidate {
+        int historyIdx;
+        gtsam::Pose3 relPose;
+        double fitnessScore;
+    };
+    std::vector<Candidate> passingCandidates;
 
     for (const auto& [historyIdx, d2] : neighbors) {
-        if (acceptedCount >= MAX_SPATIAL_LOOPS_PER_CYCLE) break;
-
         std::pair<int, int> loopPair(historyIdx, curr_node_idx);
 
         // 去重
@@ -1325,22 +1344,33 @@ void performSpatialLoopClosure(void)
         cout << "[Spatial Loop] Candidate: " << historyIdx << " ↔ " << curr_node_idx
              << " (dist=" << sqrt(d2) << "m)" << endl;
 
-        // 直接跑 ICP，使用比 SC 回环更严格的 fitness 阈值
-        auto relative_pose_optional = doICPVirtualRelative(historyIdx, curr_node_idx, spatialLoopFitnessThres);
+        double fitnessScore = 0.0;
+        auto relative_pose_optional = doICPVirtualRelative(historyIdx, curr_node_idx,
+                                                           spatialLoopFitnessThres, &fitnessScore);
         if (relative_pose_optional) {
-            gtsam::Pose3 relative_pose = relative_pose_optional.value();
-            mtxPosegraph.lock();
-            gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(historyIdx, curr_node_idx, relative_pose, robustLoopNoise));
-            writeEdge({historyIdx, curr_node_idx}, relative_pose, robustLoopNoise, edges_str);
-            mtxPosegraph.unlock();
-
-            mBuf.lock();
-            processedLoopPairs.insert(loopPair);
-            mBuf.unlock();
-
-            cout << "[Spatial Loop] Accepted: " << historyIdx << " ↔ " << curr_node_idx << endl;
-            acceptedCount++;
+            passingCandidates.push_back({historyIdx, relative_pose_optional.value(), fitnessScore});
         }
+    }
+
+    // 选 fitness 最小的那条加入图
+    if (!passingCandidates.empty()) {
+        auto best = *std::min_element(passingCandidates.begin(), passingCandidates.end(),
+            [](const Candidate& a, const Candidate& b) { return a.fitnessScore < b.fitnessScore; });
+
+        mtxPosegraph.lock();
+        gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(best.historyIdx, curr_node_idx,
+                                                          best.relPose, robustLoopNoise));
+        writeEdge({best.historyIdx, curr_node_idx}, best.relPose, robustLoopNoise, edges_str);
+        mtxPosegraph.unlock();
+
+        mBuf.lock();
+        processedLoopPairs.insert({best.historyIdx, curr_node_idx});
+        mBuf.unlock();
+
+        lastLoopClosureKeyframeIdx.store(curr_node_idx);
+
+        cout << "[Spatial Loop] Accepted: " << best.historyIdx << " ↔ " << curr_node_idx
+             << " (fitness=" << best.fitnessScore << ")" << endl;
     }
 } // performSpatialLoopClosure
 
@@ -1400,6 +1430,9 @@ void process_icp(void)
                 mBuf.lock();
                 processedLoopPairs.insert(loop_idx_pair);
                 mBuf.unlock();
+
+                // 帧间隔抑制：记录当前帧，后续 N 帧跳过检测
+                lastLoopClosureKeyframeIdx.store(curr_node_idx);
             }
         }
 
@@ -1649,6 +1682,7 @@ int main(int argc, char **argv)
     loopNoiseScore  = getParamOrDefaultDeep<double>(cfg, "loop.noise_score", 0.5);
     loopKernelParam = getParamOrDefaultDeep<double>(cfg, "loop.kernel_param", 1.0);
     loopKernelType  = getParamOrDefaultDeep<std::string>(cfg, "loop.kernel_type", std::string("geman_mcclure"));
+    loopMinFrameGap = getParamOrDefaultDeep<int>(cfg, "loop.min_frame_gap", 5);
 
     useSpatialLoopClosure    = getParamOrDefaultDeep<bool>(cfg, "spatial_loop.enabled", true);
     spatialLoopRadius        = getParamOrDefaultDeep<double>(cfg, "spatial_loop.radius", 10.0);
