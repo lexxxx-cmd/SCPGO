@@ -160,9 +160,14 @@ using std::endl;
 // ------------------------- 关键参数与运行状态 -------------------------
 double keyframeMeterGap;
 double keyframeDegGap, keyframeRadGap;
+	bool passthroughMode = false;            // 直通模式：不抽关键帧、不做回环检测，逐帧建图
 double translationAccumulated = 1000000.0; // large value means must add the first given frame.
 double rotaionAccumulated = 1000000.0; // large value means must add the first given frame.
 double simulatedSensorHz = 10.0;       // 批量模式传感器模拟频率 (Hz), 0=全速
+
+// 进度条：批量处理时的帧计数
+std::atomic<int> g_framesProcessed{0};
+int g_totalFrames = 0;
 
 bool isNowKeyFrame = false;
 
@@ -579,9 +584,6 @@ pcl::PointCloud<PointType>::Ptr removeGroundRANSAC(
             ransacGroundZ = -coeff->values[3] / coeff->values[2];
             ransacOK = true;
 
-            std::cout << "[RANSAC] Ground plane found: Z=" << ransacGroundZ
-                      << " (inliers=" << int(inlierRatio * 100)
-                      << "%, normal_z=" << zAlignment << ")" << std::endl;
         }
     }
 
@@ -616,11 +618,6 @@ pcl::PointCloud<PointType>::Ptr removeGroundRANSAC(
         if (pt.z > cutoffZ)
             filtered->push_back(pt);
     }
-
-    std::cout << "[RANSAC] " << cloudIn->size() << " → " << filtered->size()
-              << " pts (ransac=" << (ransacOK ? "ok" : "skip")
-              << ", groundZ_ema=" << estimatedGroundZ
-              << ", cutoffZ=" << cutoffZ << ")" << std::endl;
 
     return filtered;
 }
@@ -1021,6 +1018,25 @@ void process_pg()
             }
             mBuf.unlock();
 
+            // 进度条：每消费一帧更新一次
+            {
+                int done = g_framesProcessed.fetch_add(1) + 1;
+                int total = g_totalFrames;
+                if (total > 0) {
+                    int pct = (done * 100) / total;
+                    int barWidth = 30;
+                    int filled = (done * barWidth) / total;
+                    std::cout << "\r[";
+                    for (int i = 0; i < barWidth; i++)
+                        std::cout << (i < filled ? '=' : (i == filled ? '>' : ' '));
+                    std::cout << "] " << pct << "% ("
+                              << done << "/" << total << " frames, "
+                              << keyframePoses.size() << " keyframes)" << std::flush;
+                    if (done >= total)
+                        std::cout << std::endl; // 处理完成，换行
+                }
+            }
+
             // Paired publish via Foxglove WebSocket (cloud → pose, same timestamp)
             if (g_wsPublisher.enabled) {
                 g_wsPublisher.publishPairedFrame(thisKeyFrame, timeLaserOdometry, odom_curr);
@@ -1037,7 +1053,11 @@ void process_pg()
             translationAccumulated += delta_translation;
             rotaionAccumulated += (dtf.roll + dtf.pitch + dtf.yaw); // sum just naive approach.  
 
-            if( translationAccumulated > keyframeMeterGap || rotaionAccumulated > keyframeRadGap ) {
+            if (passthroughMode) {
+                isNowKeyFrame = true;
+                translationAccumulated = 0.0;
+                rotaionAccumulated = 0.0;
+            } else if( translationAccumulated > keyframeMeterGap || rotaionAccumulated > keyframeRadGap ) {
                 // 累计运动超过阈值时才提取关键帧，控制图优化节点密度。
                 isNowKeyFrame = true;
                 translationAccumulated = 0.0; // reset 
@@ -1077,6 +1097,7 @@ void process_pg()
             keyframePosesUpdated.push_back(pose_curr); // init
             keyframeTimes.push_back(timeLaserOdometry);
 
+            if (!passthroughMode) {
             // --- 滑动窗口管理 ---
             pcl::PointCloud<PointType>::Ptr windowSubmap(new pcl::PointCloud<PointType>());
             pcl::PointCloud<PointType>::Ptr windowSubmapDS(new pcl::PointCloud<PointType>());
@@ -1122,6 +1143,7 @@ void process_pg()
                 scManager.makeAndSaveScancontextAndKeys(*windowSubmapDS);
             }
             // --- 滑动窗口管理结束 ---
+            } // !passthroughMode
 
             laserCloudMapPGORedraw = true;
             mKF.unlock();
@@ -1160,7 +1182,6 @@ void process_pg()
                         gtsam::Point3 gpsConstraint(recentOptimizedX, recentOptimizedY, curr_altitude_offseted); // in this example, only adjusting altitude (for x and y, very big noises are set) 
                         mtxRecentPose.unlock();
                         gtSAMgraph.add(gtsam::GPSFactor(curr_node_idx, gpsConstraint, robustGPSNoise));
-                        cout << "GPS factor added at node " << curr_node_idx << endl;
                     }
                     initialEstimate.insert(curr_node_idx, poseTo);                
                     writeEdge({prev_node_idx, curr_node_idx}, relPose, odomNoise, edges_str); // giseop
@@ -1336,6 +1357,7 @@ void process_lcd(void)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         if (g_shutdown_requested.load()) break;
+        if (passthroughMode) continue;
         performSCLoopClosure();
         performSpatialLoopClosure();
     }
@@ -1402,7 +1424,6 @@ void process_isam(void)
         if( gtSAMgraphMade ) {
             mtxPosegraph.lock();
             runISAM2opt();
-            cout << "running isam2 optimization ..." << endl;
             mtxPosegraph.unlock();
 
             mKF.lock();
@@ -1441,7 +1462,7 @@ void saveGlobalMap(const std::string& _filename)
     mKF.unlock();
 
     pcl::VoxelGrid<PointType> voxel;
-    voxel.setLeafSize(0.05f, 0.05f, 0.05f);
+    voxel.setLeafSize(0.01f, 0.01f, 0.01f);
     pcl::PointCloud<PointType>::Ptr filtered(new pcl::PointCloud<PointType>());
     voxel.setInputCloud(globalMap);
     voxel.filter(*filtered);
@@ -1637,6 +1658,7 @@ int main(int argc, char **argv)
     double mapVizFilterSize  = getParamOrDefault<double>(cfg, "mapviz_filter_size", 0.4);
     double inputSilenceTimeout = getParamOrDefault<double>(cfg, "input_silence_timeout", 8.0);
     simulatedSensorHz = getParamOrDefault<double>(cfg, "simulated_sensor_hz", 10.0);
+    passthroughMode = getParamOrDefault<bool>(cfg, "passthrough_mode", false);
 
     useGPS = getParamOrDefaultDeep<bool>(cfg, "input.use_gps", false);
 
@@ -1708,6 +1730,7 @@ int main(int argc, char **argv)
         loadedCount++;
     }
     std::cout << "[INFO] Loaded " << loadedCount << " frames (PCD + poses)" << std::endl;
+    g_totalFrames = loadedCount;
 
     if (loadedCount == 0) {
         std::cerr << "[ERROR] No frames loaded. Check config paths and file format." << std::endl;
