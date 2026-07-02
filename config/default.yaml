@@ -30,7 +30,8 @@ scan_context:
   max_world_distance: 6.0     # reject SC loops where world-frame distance > N meters
 
 # -------------------- Feature Switches --------------------
-passthrough_mode: false              # skip keyframe selection & loop closure, process all frames as-is
+passthrough_mode: false              # skip keyframe selection, process all frames as keyframes
+enable_loop_closure: true            # enable loop closure detection & PGO optimization. Set false with passthrough_mode=true for fast pure-odometry graph
 use_ground_removal: false             # RANSAC ground removal
 use_icp_submap_enhancement: false     # sliding window + spatial neighbors for ICP
 

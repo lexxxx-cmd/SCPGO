@@ -161,6 +161,7 @@ using std::endl;
 double keyframeMeterGap;
 double keyframeDegGap, keyframeRadGap;
 	bool passthroughMode = false;            // 直通模式：不抽关键帧、不做回环检测，逐帧建图
+	bool enableLoopClosure = true;           // 是否启用回环检测与位姿图优化，false 时仅构建纯里程计图
 double translationAccumulated = 1000000.0; // large value means must add the first given frame.
 double rotaionAccumulated = 1000000.0; // large value means must add the first given frame.
 double simulatedSensorHz = 10.0;       // 批量模式传感器模拟频率 (Hz), 0=全速
@@ -1204,7 +1205,8 @@ void process_pg()
             pgTimeSaveStream << timeLaser << std::endl; // path
 
             // 模拟传感器延时：让 isam/lcd 有机会在同频率下穿插运行
-            if (simulatedSensorHz > 0.0) {
+            // passthrough 模式或无回环时无需等待，全速处理
+            if (!passthroughMode && enableLoopClosure && simulatedSensorHz > 0.0) {
                 auto frameDelay = std::chrono::milliseconds(
                     static_cast<int>(1000.0 / simulatedSensorHz));
                 std::this_thread::sleep_for(frameDelay);
@@ -1387,7 +1389,7 @@ void process_lcd(void)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         if (g_shutdown_requested.load()) break;
-        if (passthroughMode) continue;
+        if (passthroughMode || !enableLoopClosure) continue;
         performSCLoopClosure();
         performSpatialLoopClosure();
     }
@@ -1398,6 +1400,12 @@ void process_icp(void)
 {
     while(!g_shutdown_requested.load())
     {
+        if (!enableLoopClosure) {
+            std::chrono::milliseconds dura(2);
+            std::this_thread::sleep_for(dura);
+            continue;
+        }
+
 		while ( !g_shutdown_requested.load() && !scLoopICPBuf.empty() )
         {
             if( scLoopICPBuf.size() > 30 ) {
@@ -1454,6 +1462,7 @@ void process_isam(void)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         if (g_shutdown_requested.load()) break;
+        if (!enableLoopClosure) continue;
         if( gtSAMgraphMade ) {
             mtxPosegraph.lock();
             runISAM2opt();
@@ -1693,6 +1702,14 @@ int main(int argc, char **argv)
     double inputSilenceTimeout = getParamOrDefault<double>(cfg, "input_silence_timeout", 8.0);
     simulatedSensorHz = getParamOrDefault<double>(cfg, "simulated_sensor_hz", 10.0);
     passthroughMode = getParamOrDefault<bool>(cfg, "passthrough_mode", false);
+    enableLoopClosure = getParamOrDefault<bool>(cfg, "enable_loop_closure", true);
+
+    std::cout << "[INFO] Loop closure & PGO: " << (enableLoopClosure ? "ENABLED" : "DISABLED (pure odometry graph)")
+              << std::endl;
+    if (!enableLoopClosure && passthroughMode) {
+        std::cout << "[INFO] Fast passthrough mode active — all frames as keyframes, no delay, no optimization"
+                  << std::endl;
+    }
 
     useGPS = getParamOrDefaultDeep<bool>(cfg, "input.use_gps", false);
 
@@ -1834,6 +1851,13 @@ int main(int argc, char **argv)
     g_wsPublisher.shutdown();
 
     // -------------------- 5. 保存最终结果 --------------------
+    // 如果回环检测与优化被禁用，process_isam 全程未运行，此处做一次收尾优化
+    // （纯里程计图无需迭代，单次 iSAM2 即可得到最终位姿，供后续保存函数使用）
+    if (!enableLoopClosure && gtSAMgraphMade) {
+        std::cout << "[INFO] Loop closure was disabled — running final single-shot optimization..." << std::endl;
+        runISAM2opt();
+    }
+
     std::cout << "[INFO] All threads stopped. Saving final results -- DO NOT INTERRUPT..." << std::endl;
     std::cout << "[INFO]   [1/6] Saving optimized poses (TUM)..." << std::endl;
     saveOptimizedVerticesTUMformat(isamCurrentEstimate, keyframeTimes, pgTUMformat);
