@@ -426,6 +426,30 @@ void saveOptimizedVerticesTUMformat(gtsam::Values _estimates, const std::vector<
     }
 }
 
+// 直接从 Pose6D 向量保存 TUM 格式（不依赖 iSAM2，用于纯里程计模式）
+void saveKeyframePosesTUMformat(const std::vector<Pose6D>& _poses,
+                                const std::vector<double>& _keyframeTimes,
+                                std::string _filename)
+{
+    std::fstream stream(_filename.c_str(), std::fstream::out);
+    stream << std::fixed << std::setprecision(6);
+
+    size_t n = std::min(_poses.size(), _keyframeTimes.size());
+    for (size_t i = 0; i < n; i++) {
+        const Pose6D& p = _poses[i];
+        Eigen::Quaternionf q(
+            Eigen::AngleAxisf(p.roll,  Eigen::Vector3f::UnitX()) *
+            Eigen::AngleAxisf(p.pitch, Eigen::Vector3f::UnitY()) *
+            Eigen::AngleAxisf(p.yaw,   Eigen::Vector3f::UnitZ()));
+
+        stream << _keyframeTimes[i] << " "
+               << p.x << " " << p.y << " " << p.z << " "
+               << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
+    }
+    stream.close();
+    cout << "Saved (odometry) TUM poses: " << _filename << " (" << n << " keyframes)" << endl;
+}
+
 // 读取 TUM 格式位姿文件：timestamp tx ty tz qx qy qz qw
 // PCD 文件按时间戳命名且已排序，这里按行序读入 deque，与 scanPcdDirectory 顺序对齐
 std::deque<OdomData> loadTumPoses(const std::string& path)
@@ -1707,7 +1731,7 @@ int main(int argc, char **argv)
     std::cout << "[INFO] Loop closure & PGO: " << (enableLoopClosure ? "ENABLED" : "DISABLED (pure odometry graph)")
               << std::endl;
     if (!enableLoopClosure && passthroughMode) {
-        std::cout << "[INFO] Fast passthrough mode active — all frames as keyframes, no delay, no optimization"
+        std::cout << "[INFO] Fast passthrough mode active -- all frames as keyframes, no delay, no optimization"
                   << std::endl;
     }
 
@@ -1851,16 +1875,13 @@ int main(int argc, char **argv)
     g_wsPublisher.shutdown();
 
     // -------------------- 5. 保存最终结果 --------------------
-    // 如果回环检测与优化被禁用，process_isam 全程未运行，此处做一次收尾优化
-    // （纯里程计图无需迭代，单次 iSAM2 即可得到最终位姿，供后续保存函数使用）
-    if (!enableLoopClosure && gtSAMgraphMade) {
-        std::cout << "[INFO] Loop closure was disabled — running final single-shot optimization..." << std::endl;
-        runISAM2opt();
-    }
-
     std::cout << "[INFO] All threads stopped. Saving final results -- DO NOT INTERRUPT..." << std::endl;
     std::cout << "[INFO]   [1/6] Saving optimized poses (TUM)..." << std::endl;
-    saveOptimizedVerticesTUMformat(isamCurrentEstimate, keyframeTimes, pgTUMformat);
+    if (enableLoopClosure) {
+        saveOptimizedVerticesTUMformat(isamCurrentEstimate, keyframeTimes, pgTUMformat);
+    } else {
+        saveKeyframePosesTUMformat(keyframePosesUpdated, keyframeTimes, pgTUMformat);
+    }
     std::cout << "[INFO]   [2/6] Saving odometry poses (KITTI)..." << std::endl;
     saveOdometryVerticesKITTIformat(odomKITTIformat);
     std::cout << "[INFO]   [3/6] Saving pose graph (g2o)..." << std::endl;
