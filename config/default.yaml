@@ -19,8 +19,8 @@ output:
 
 # -------------------- Keyframe Selection --------------------
 keyframe:
-  meter_gap: 0.5       # add keyframe every N meters of translation
-  deg_gap: 10.0         # add keyframe every N degrees of rotation
+  meter_gap: 1       # add keyframe every N meters of translation
+  deg_gap: 30.0         # add keyframe every N degrees of rotation
 
 # -------------------- Scan Context --------------------
 scan_context:
@@ -30,15 +30,15 @@ scan_context:
   max_world_distance: 6.0     # reject SC loops where world-frame distance > N meters
 
 # -------------------- Feature Switches --------------------
-passthrough_mode: true              # skip keyframe selection, process all frames as keyframes
-enable_loop_closure: false            # enable loop closure detection & PGO optimization. Set false with passthrough_mode=true for fast pure-odometry graph
+passthrough_mode: false              # skip keyframe selection, process all frames as keyframes
+enable_loop_closure: true            # enable loop closure detection & PGO optimization. Set false with passthrough_mode=true for fast pure-odometry graph
 use_ground_removal: false             # RANSAC ground removal
 use_icp_submap_enhancement: false     # sliding window + spatial neighbors for ICP
 
 # -------------------- ICP Loop Verification --------------------
 icp:
   max_correspondence_distance: 150.0
-  fitness_score_threshold: 0.2
+  fitness_score_threshold: 0.1
   min_source_points: 50
   min_target_points: 50
   max_translation: 50.0
@@ -46,10 +46,10 @@ icp:
 
 # -------------------- Loop Closure Robust Kernel --------------------
 loop:
-  noise_score: 0.3
+  noise_score: 0.2
   kernel_param: 1.0
   kernel_type: "cauchy"    # cauchy / dcs / geman_mcclure
-  min_frame_gap: 10         # after a loop edge is added, skip next N keyframes from detection
+  min_frame_gap: 20         # after a loop edge is added, skip next N keyframes from detection
 
 # -------------------- Spatial Loop Closure --------------------
 spatial_loop:
@@ -69,7 +69,7 @@ simulated_sensor_hz: 2.0          # frame playback rate in batch mode (Hz), 0=fu
 
 # -------------------- Foxglove WebSocket --------------------
 websocket:
-  enabled: true                       # master on/off switch
+  enabled: false                       # master on/off switch
   host: "0.0.0.0"                     # bind address
   port: 8765                          # listening port
   publish_pointcloud: true

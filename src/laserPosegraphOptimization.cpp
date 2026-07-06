@@ -287,9 +287,7 @@ double recentOptimizedY = 0.0;
 // ------------------------- 导出文件 -------------------------
 
 std::string save_directory;
-std::string pgTUMformat;
-std::string odomKITTIformat;
-std::fstream pgG2oSaveStream, pgTimeSaveStream;
+std::fstream pgG2oSaveStream;
 
 std::vector<std::string> edges_str; // used in writeEdge
 
@@ -361,13 +359,9 @@ gtsam::Pose3 Pose6DtoGTSAMPose3(const Pose6D& p)
 } // Pose6DtoGTSAMPose3
 
 // 保存最终位姿图为 g2o 格式，便于离线检查或再次优化。
-void saveGTSAMgraphG2oFormat(const gtsam::Values& _estimates)
+void saveGTSAMgraphG2oFormat(const gtsam::Values& _estimates, const std::string& _outputPath)
 {
-    // save pose graph (runs when programe is closing)
-    // cout << "****************************************************" << endl; 
-    cout << "Saving the posegraph ..." << endl; // giseop
-
-    pgG2oSaveStream = std::fstream(save_directory + "graph.g2o", std::fstream::out);
+    pgG2oSaveStream = std::fstream(_outputPath, std::fstream::out);
 
     int pose_idx = 0;
     for(const auto& _pose6d: keyframePoses) {
@@ -382,74 +376,6 @@ void saveGTSAMgraphG2oFormat(const gtsam::Values& _estimates)
 }
 
 // 导出关键帧轨迹为 KITTI 格式，方便和常见 odometry 评测工具对接。
-void saveOdometryVerticesKITTIformat(std::string _filename)
-{
-    // ref from gtsam's original code "dataset.cpp"
-    std::fstream stream(_filename.c_str(), std::fstream::out);
-    for(const auto& _pose6d: keyframePoses) {
-        gtsam::Pose3 pose = Pose6DtoGTSAMPose3(_pose6d);
-        Point3 t = pose.translation();
-        Rot3 R = pose.rotation();
-        auto col1 = R.column(1); // Point3
-        auto col2 = R.column(2); // Point3
-        auto col3 = R.column(3); // Point3
-
-        stream << col1.x() << " " << col2.x() << " " << col3.x() << " " << t.x() << " "
-               << col1.y() << " " << col2.y() << " " << col3.y() << " " << t.y() << " "
-               << col1.z() << " " << col2.z() << " " << col3.z() << " " << t.z() << std::endl;
-    }
-}
-
-// 导出优化后的关键帧轨迹为 TUM 格式，包含时间戳和四元数。
-void saveOptimizedVerticesTUMformat(gtsam::Values _estimates, const std::vector<double>& _keyframeTimes, std::string _filename)
-{
-    using namespace gtsam;
-
-    std::fstream stream(_filename.c_str(), std::fstream::out);
-    stream.precision(std::numeric_limits<double>::max_digits10);
-
-    for(const auto& key_value: _estimates) {
-        auto p = dynamic_cast<const GenericValue<Pose3>*>(&key_value.value);
-        if (!p) continue;
-
-        size_t node_idx = key_value.key;
-        double timestamp = (node_idx < _keyframeTimes.size()) ? _keyframeTimes[node_idx] : 0.0;
-
-        const Pose3& pose = p->value();
-        Point3 t = pose.translation();
-        auto q = pose.rotation().toQuaternion();
-
-        stream << std::fixed << std::setprecision(6)
-               << timestamp << " "
-               << t.x() << " " << t.y() << " " << t.z() << " "
-               << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
-    }
-}
-
-// 直接从 Pose6D 向量保存 TUM 格式（不依赖 iSAM2，用于纯里程计模式）
-void saveKeyframePosesTUMformat(const std::vector<Pose6D>& _poses,
-                                const std::vector<double>& _keyframeTimes,
-                                std::string _filename)
-{
-    std::fstream stream(_filename.c_str(), std::fstream::out);
-    stream << std::fixed << std::setprecision(6);
-
-    size_t n = std::min(_poses.size(), _keyframeTimes.size());
-    for (size_t i = 0; i < n; i++) {
-        const Pose6D& p = _poses[i];
-        Eigen::Quaternionf q(
-            Eigen::AngleAxisf(p.roll,  Eigen::Vector3f::UnitX()) *
-            Eigen::AngleAxisf(p.pitch, Eigen::Vector3f::UnitY()) *
-            Eigen::AngleAxisf(p.yaw,   Eigen::Vector3f::UnitZ()));
-
-        stream << _keyframeTimes[i] << " "
-               << p.x << " " << p.y << " " << p.z << " "
-               << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
-    }
-    stream.close();
-    cout << "Saved (odometry) TUM poses: " << _filename << " (" << n << " keyframes)" << endl;
-}
-
 // 读取 TUM 格式位姿文件：timestamp tx ty tz qx qy qz qw
 // PCD 文件按时间戳命名且已排序，这里按行序读入 deque，与 scanPcdDirectory 顺序对齐
 std::deque<OdomData> loadTumPoses(const std::string& path)
@@ -903,9 +829,6 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
     int sourcePts = (int)cureKeyframeCloud->size();
     int targetPts = (int)targetKeyframeCloud->size();
     if (sourcePts < icpMinSourcePoints || targetPts < icpMinTargetPoints) {
-        cout << "[ICP] Reject: too few points (source=" << sourcePts
-             << " < " << icpMinSourcePoints << " or target=" << targetPts
-             << " < " << icpMinTargetPoints << ")" << endl;
         return std::nullopt;
     }
 
@@ -932,8 +855,6 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
 
     // ---- 校验 1: ICP 收敛 + fitness score ----
     if (icp.hasConverged() == false || icp.getFitnessScore() > effectiveFitnessThres) {
-        cout << "[ICP] Reject: fitness " << icp.getFitnessScore()
-             << " > " << effectiveFitnessThres << endl;
         return std::nullopt;
     }
 
@@ -947,10 +868,6 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
         double rotMag = sqrt(roll*roll + pitch*pitch + yaw*yaw); // 欧拉角范数近似旋转量
 
         if (transMag > icpMaxTranslation || rotMag > icpMaxRotationRad) {
-            cout << "[ICP] Reject: correction too large (trans=" << transMag
-                 << "m max=" << icpMaxTranslation
-                 << "m, rot=" << rad2deg(rotMag)
-                 << "° max=" << rad2deg(icpMaxRotationRad) << "°)" << endl;
             return std::nullopt;
         }
 
@@ -983,21 +900,11 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
         const double MAX_CONSISTENCY_ROT   = icpMaxRotationRad * 0.8;  // 一致性旋转阈值
 
         if (consistencyTrans > MAX_CONSISTENCY_TRANS || consistencyRot > MAX_CONSISTENCY_ROT) {
-            cout << "[ICP] Reject: inconsistent with odometry (trans_diff=" << consistencyTrans
-                 << "m max=" << MAX_CONSISTENCY_TRANS
-                 << "m, rot_diff=" << rad2deg(consistencyRot)
-                 << "° max=" << rad2deg(MAX_CONSISTENCY_ROT) << "°)" << endl;
             return std::nullopt;
         }
 
         double fitnessOut = icp.getFitnessScore();
         if (out_fitness_score) *out_fitness_score = fitnessOut;
-
-        cout << "[ICP] Passed: fitness=" << fitnessOut
-             << ", corr_trans=" << transMag << "m"
-             << ", corr_rot=" << rad2deg(rotMag) << "°"
-             << ", consistency_trans=" << consistencyTrans << "m"
-             << ", consistency_rot=" << rad2deg(consistencyRot) << "°" << endl;
 
         return icpRelative;
     }
@@ -1196,7 +1103,6 @@ void process_pg()
 
                 gtSAMgraphMade = true; 
 
-                cout << "posegraph prior node " << init_node_idx << " added" << endl;
             } else /* consecutive node (and odom factor) after the prior added */ { // == keyframePoses.size() > 1 
                 gtsam::Pose3 poseFrom = Pose6DtoGTSAMPose3(keyframePoses.at(prev_node_idx));
                 gtsam::Pose3 poseTo = Pose6DtoGTSAMPose3(keyframePoses.at(curr_node_idx));
@@ -1220,13 +1126,8 @@ void process_pg()
                 }
                 mtxPosegraph.unlock();
 
-                if(curr_node_idx % 100 == 0)
-                    cout << "posegraph odom node " << curr_node_idx << " added." << endl;
             }
             // if want to print the current graph, use gtSAMgraph.print("\nFactor Graph:\n");
-
-            // save utility
-            pgTimeSaveStream << timeLaser << std::endl; // path
 
             // 模拟传感器延时：让 isam/lcd 有机会在同频率下穿插运行
             // passthrough 模式或无回环时无需等待，全速处理
@@ -1290,10 +1191,6 @@ void performSCLoopClosure(void)
                 mKF.unlock();
 
                 if (worldDist > scLoopMaxWorldDistance) {
-                    cout << "[SC Loop] Reject: world distance " << worldDist
-                         << "m > " << scLoopMaxWorldDistance
-                         << "m (SC matched " << prev_node_idx << " ↔ " << curr_node_idx_sc << ")"
-                         << endl;
                     return;
                 }
             } else {
@@ -1305,7 +1202,6 @@ void performSCLoopClosure(void)
         scLoopICPBuf.push(std::pair<int, int>(prev_node_idx, curr_node_idx_sc));
         mBuf.unlock();
 
-        cout << "Loop detected! - between " << prev_node_idx << " and " << curr_node_idx_sc << "" << endl;
     }
 } // performSCLoopClosure
 
@@ -1367,9 +1263,6 @@ void performSpatialLoopClosure(void)
         mBuf.unlock();
         if (alreadyDone) continue;
 
-        cout << "[Spatial Loop] Candidate: " << historyIdx << " ↔ " << curr_node_idx
-             << " (dist=" << sqrt(d2) << "m)" << endl;
-
         double fitnessScore = 0.0;
         auto relative_pose_optional = doICPVirtualRelative(historyIdx, curr_node_idx,
                                                            spatialLoopFitnessThres, &fitnessScore);
@@ -1394,9 +1287,6 @@ void performSpatialLoopClosure(void)
         mBuf.unlock();
 
         lastLoopClosureKeyframeIdx.store(curr_node_idx);
-
-        cout << "[Spatial Loop] Accepted: " << best.historyIdx << " ↔ " << curr_node_idx
-             << " (fitness=" << best.fitnessScore << ")" << endl;
     }
 } // performSpatialLoopClosure
 
@@ -1432,9 +1322,6 @@ void process_icp(void)
 
 		while ( !g_shutdown_requested.load() && !scLoopICPBuf.empty() )
         {
-            if( scLoopICPBuf.size() > 30 ) {
-                std::cout << "[WARN] Too many loop closure candidates to be ICPed is waiting ... Do process_lcd less frequently (adjust loopClosureFrequency)" << std::endl;
-            }
 
             mBuf.lock();
             std::pair<int, int> loop_idx_pair = scLoopICPBuf.front();
@@ -1493,9 +1380,7 @@ void process_isam(void)
             mtxPosegraph.unlock();
 
             mKF.lock();
-            saveOptimizedVerticesTUMformat(isamCurrentEstimate, keyframeTimes, pgTUMformat); // pose
-            saveOdometryVerticesKITTIformat(odomKITTIformat); // pose
-            saveGTSAMgraphG2oFormat(isamCurrentEstimate);
+            saveGTSAMgraphG2oFormat(isamCurrentEstimate, saveKeyframesDirectory + "keyframes/graph.g2o");
             mKF.unlock();
 
             // Publish global point cloud map after each PGO optimization
@@ -1587,71 +1472,6 @@ void saveKeyframes(void)
     cout << "Keyframes saved: " << n << " nodes → " << kf_root << endl;
 } // saveKeyframes
 
-void recoverAllPosesTUM(const std::string& _filename)
-{
-    if (allFrameTimestamps.empty() || keyframePosesUpdated.empty()) return;
-
-    // 先把每个关键帧映射回原始帧序号，后面才能把优化后的位姿传播到每一帧。
-    std::vector<int> kfAllIdx(keyframeTimes.size(), -1);
-    for (size_t k = 0; k < keyframeTimes.size(); k++) {
-        for (size_t a = 0; a < allFrameTimestamps.size(); a++) {
-            if (std::abs(allFrameTimestamps[a] - keyframeTimes[k]) < 1e-9) {
-                kfAllIdx[k] = (int)a;
-                break;
-            }
-        }
-    }
-
-    std::fstream stream(_filename.c_str(), std::fstream::out);
-    stream << std::fixed << std::setprecision(6);
-
-    int lastKfKfIdx = 0;
-    for (size_t i = 0; i < allFrameTimestamps.size(); i++) {
-        // 找到当前原始帧对应的最近一个关键帧。
-        int kfKfIdx = lastKfKfIdx;
-        for (size_t k = (size_t)lastKfKfIdx + 1; k < keyframeTimes.size(); k++) {
-            if (kfAllIdx[k] >= 0 && kfAllIdx[k] <= (int)i)
-                kfKfIdx = (int)k;
-            else
-                break;
-        }
-        lastKfKfIdx = kfKfIdx;
-        if (kfKfIdx >= (int)keyframePosesUpdated.size()) continue;
-
-        // 从该关键帧的优化结果出发，再用关键帧后面的原始里程计增量恢复当前帧位姿。
-        Pose6D& kfPose = keyframePosesUpdated[kfKfIdx];
-        Eigen::Affine3f result = pcl::getTransformation(
-            kfPose.x, kfPose.y, kfPose.z,
-            kfPose.roll, kfPose.pitch, kfPose.yaw);
-
-        int kfAnchor = kfAllIdx[kfKfIdx];
-
-        // 把关键帧到当前帧之间的里程计增量逐步串起来，补回非关键帧轨迹。
-        if ((int)i > kfAnchor && kfAnchor >= 0) {
-            for (int j = kfAnchor + 1; j <= (int)i; j++) {
-                Eigen::Affine3f prevOdom = pcl::getTransformation(
-                    allFrameOdomPoses[j-1].x, allFrameOdomPoses[j-1].y, allFrameOdomPoses[j-1].z,
-                    allFrameOdomPoses[j-1].roll, allFrameOdomPoses[j-1].pitch, allFrameOdomPoses[j-1].yaw);
-                Eigen::Affine3f currOdom = pcl::getTransformation(
-                    allFrameOdomPoses[j].x, allFrameOdomPoses[j].y, allFrameOdomPoses[j].z,
-                    allFrameOdomPoses[j].roll, allFrameOdomPoses[j].pitch, allFrameOdomPoses[j].yaw);
-                Eigen::Matrix4f delta = prevOdom.matrix().inverse() * currOdom.matrix();
-                result.matrix() = result.matrix() * delta;
-            }
-        }
-
-        Eigen::Vector3f t = result.translation();
-        Eigen::Quaternionf q(result.rotation());
-
-        stream << allFrameTimestamps[i] << " "
-               << t.x() << " " << t.y() << " " << t.z() << " "
-               << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
-    }
-
-    stream.close();
-    cout << "All poses recovered: " << _filename << " (" << allFrameTimestamps.size() << " frames)" << endl;
-} // recoverAllPosesTUM
-
 
 // 程序入口：加载 YAML 配置 → 读入数据 → 启动处理线程 → 等待完成 → 保存结果。
 int main(int argc, char **argv)
@@ -1659,8 +1479,36 @@ int main(int argc, char **argv)
     signal(SIGINT,  gracefulShutdownHandler);
     signal(SIGTERM, gracefulShutdownHandler);
 
-    // -------------------- 1. 加载 YAML 配置 --------------------
-    std::string configPath = (argc >= 2) ? argv[1] : "config/default.yaml";
+    // -------------------- 1. 命令行参数解析 --------------------
+    std::string configPath = "config/default.yaml";
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: alaserPGO [--config <path>]" << std::endl;
+            std::cout << std::endl;
+            std::cout << "SCPGO: Scan Context + Pose Graph Optimization for LiDAR SLAM" << std::endl;
+            std::cout << std::endl;
+            std::cout << "Options:" << std::endl;
+            std::cout << "  --config <path>   Path to YAML configuration file" << std::endl;
+            std::cout << "                    (default: config/default.yaml)" << std::endl;
+            std::cout << "  --help, -h        Show this help message" << std::endl;
+            std::cout << std::endl;
+            std::cout << "Example:" << std::endl;
+            std::cout << "  alaserPGO --config /path/to/config.yaml" << std::endl;
+            return 0;
+        } else if (arg == "--config") {
+            if (i + 1 < argc) {
+                configPath = argv[++i];
+            } else {
+                std::cerr << "[ERROR] --config requires a path argument" << std::endl;
+                return 1;
+            }
+        } else {
+            std::cerr << "[ERROR] Unknown argument: " << arg << std::endl;
+            std::cerr << "        Use --help for usage information." << std::endl;
+            return 1;
+        }
+    }
     std::cout << "[INFO] Loading config: " << configPath << std::endl;
 
     YAML::Node cfg;
@@ -1684,12 +1532,6 @@ int main(int argc, char **argv)
 
     // 确保输出目录以 / 结尾
     if (!save_directory.empty() && save_directory.back() != '/') save_directory += '/';
-
-    pgTUMformat = save_directory + "optimized_poses.txt";
-    odomKITTIformat = save_directory + "odom_poses.txt";
-
-    pgTimeSaveStream = std::fstream(save_directory + "times.txt", std::fstream::out);
-    pgTimeSaveStream.precision(std::numeric_limits<double>::max_digits10);
 
     // 算法参数
     keyframeMeterGap  = getParamOrDefaultDeep<double>(cfg, "keyframe.meter_gap", 2.0);
@@ -1876,24 +1718,14 @@ int main(int argc, char **argv)
 
     // -------------------- 5. 保存最终结果 --------------------
     std::cout << "[INFO] All threads stopped. Saving final results -- DO NOT INTERRUPT..." << std::endl;
-    std::cout << "[INFO]   [1/6] Saving optimized poses (TUM)..." << std::endl;
-    if (enableLoopClosure) {
-        saveOptimizedVerticesTUMformat(isamCurrentEstimate, keyframeTimes, pgTUMformat);
-    } else {
-        saveKeyframePosesTUMformat(keyframePosesUpdated, keyframeTimes, pgTUMformat);
-    }
-    std::cout << "[INFO]   [2/6] Saving odometry poses (KITTI)..." << std::endl;
-    saveOdometryVerticesKITTIformat(odomKITTIformat);
-    std::cout << "[INFO]   [3/6] Saving pose graph (g2o)..." << std::endl;
-    saveGTSAMgraphG2oFormat(isamCurrentEstimate);
-    std::cout << "[INFO]   [4/6] Saving global map (PCD)..." << std::endl;
+    // 确保 keyframes 目录存在（g2o 也放入其中，须先创建目录）
+    boost::filesystem::create_directories(saveKeyframesDirectory + "/keyframes/");
+    std::cout << "[INFO]   [1/3] Saving pose graph (g2o)..." << std::endl;
+    saveGTSAMgraphG2oFormat(isamCurrentEstimate, saveKeyframesDirectory + "keyframes/graph.g2o");
+    std::cout << "[INFO]   [2/3] Saving global map (PCD)..." << std::endl;
     saveGlobalMap(save_directory + "global_map.pcd");
-    std::cout << "[INFO]   [5/6] Saving keyframes..." << std::endl;
+    std::cout << "[INFO]   [3/3] Saving keyframes..." << std::endl;
     saveKeyframes();
-    std::cout << "[INFO]   [6/6] Recovering all poses (TUM)..." << std::endl;
-    recoverAllPosesTUM(save_directory + "all_optimized_poses.txt");
-
-    pgTimeSaveStream.close();
 
     std::cout << "[INFO] All saves complete. Exiting." << std::endl;
     return 0;
