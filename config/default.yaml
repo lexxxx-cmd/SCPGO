@@ -32,7 +32,6 @@ scan_context:
 # -------------------- Feature Switches --------------------
 passthrough_mode: false              # skip keyframe selection, process all frames as keyframes
 enable_loop_closure: true            # enable loop closure detection & PGO optimization. Set false with passthrough_mode=true for fast pure-odometry graph
-use_ground_removal: false             # RANSAC ground removal
 use_icp_submap_enhancement: false     # sliding window + spatial neighbors for ICP
 
 # -------------------- ICP Loop Verification --------------------
@@ -57,9 +56,6 @@ spatial_loop:
   radius: 5.0                    # Euclidean distance threshold (m)
   fitness_thres: 0.15             # stricter ICP fitness than SC loops
   min_separation: 50              # minimum keyframe index gap
-
-# -------------------- Map Visualization --------------------
-mapviz_filter_size: 0.4           # leaf size for global map downsampling
 
 # -------------------- Graceful Shutdown --------------------
 input_silence_timeout: 50.0        # auto-exit after N seconds of inactivity (0=disabled)
